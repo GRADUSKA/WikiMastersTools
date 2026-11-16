@@ -8,8 +8,8 @@
         AUTO_OPEN_SESSION_KEY, AUTO_OPEN_MIN_MINUTES_KEY, AUTO_OPEN_MAX_MINUTES_KEY,
         AUTO_OPEN_DEFAULT_MIN_MINUTES, AUTO_OPEN_DEFAULT_MAX_MINUTES,
         ALL_COLLECTION_KEY, cacheMemory, isPullsPage, isLastPullCardVisible,
-        normalizeTitle, readLocalValue, writeLocalValue, storageGet, storageSet,
-        reportError, createSponsorNote
+        normalizeTitle, readLocalValue, writeLocalValue, readCollection, storageSet, toStoredCard,
+        reportError
       } = runtime.core;
       const { formatAverage, chooseAverage } = runtime.priceUi;
 
@@ -441,7 +441,7 @@
           const cacheNote = document.createElement('div');
           cacheNote.className = 'wm-pulls-cache-note';
           cacheNote.textContent = 'Les prix moyens utilisés par les outils sont conservés dans le cache local.';
-          info.append(cacheNote, createSponsorNote());
+          info.append(cacheNote);
         }
 
         const pageSubtitle = [...header.children].find((el) => el.tagName === 'P');
@@ -707,11 +707,11 @@
       }
 
       function mergePulledCardsIntoCollectionCache(cards) {
-        const stored = storageGet(ALL_COLLECTION_KEY);
-        const entry = stored[ALL_COLLECTION_KEY];
+        // Lecture sans copie : rien n'est modifié sur place, chaque carte changée est recréée.
+        const entry = readCollection();
         if (!Array.isArray(entry?.cards) || !entry.cards.length) return;
 
-        const byId = new Map(entry.cards.map((card) => [card.id, { ...card }]));
+        const byId = new Map(entry.cards.map((card) => [card.id, card]));
         const addedCounts = new Map();
 
         for (const card of cards) {
@@ -724,13 +724,13 @@
 
         for (const [id, amount] of addedCounts) {
           const current = byId.get(id);
-          current.count = (Number(current.count) || 0) + amount;
+          byId.set(id, { ...current, count: (Number(current.count) || 0) + amount });
         }
 
         storageSet({
           [ALL_COLLECTION_KEY]: {
             ...entry,
-            cards: [...byId.values()]
+            cards: [...byId.values()].map(toStoredCard)
           }
         });
       }
@@ -852,6 +852,14 @@
         runtime.pullStats.recordPullStats(cards);
         mergePulledCardsIntoCollectionCache(cards);
 
+        // Comme pour « Tout ouvrir » : chargé même sans le récap, pour les statistiques de tirage.
+        // Prioritaire : un paquet qu'on vient d'ouvrir ne doit pas attendre un chargement de fond.
+        try {
+          runtime.priceLoader.loadCacheForCards(cards, { priority: true });
+        } catch (error) {
+          reportError('paquet', error);
+        }
+
         if (!runtime.settings.isEnabled('packRecap')) return;
 
         activePackRecap = {
@@ -859,13 +867,7 @@
           cards
         };
         packRecapDismissed = false;
-
-        try {
-          runtime.priceLoader.loadCacheForCards(cards);
-          renderPackRecap();
-        } catch (error) {
-          reportError('paquet', error);
-        }
+        renderPackRecap();
       }
 
 
@@ -906,7 +908,7 @@
 
         const uniquePackCards = [...new Map(packCards.map((card) => [card.id, card])).values()];
         try {
-          runtime.priceLoader.loadCacheForCards(uniquePackCards);
+          runtime.priceLoader.loadCacheForCards(uniquePackCards, { priority: true });
         } catch (error) {
           reportError('prix pendant tout ouvrir', error);
         }
@@ -938,7 +940,8 @@
             session.runs += 1;
             writeAutoOpenSession(session);
           }
-          if (!detail.ok && detail.error) appendAutomaticOpenResult({ ok: false, error: detail.error });
+          // Un autre onglet ouvre déjà : rien n'a échoué, on reprend simplement le calendrier commun.
+          if (!detail.ok && detail.error && !detail.lockBusy) appendAutomaticOpenResult({ ok: false, error: detail.error });
           document.getElementById('wm-open-all-overlay')?.remove();
           document.getElementById('wm-pack-recap')?.remove();
           openAllSummaryCards = [];
@@ -948,7 +951,7 @@
             autoOpenShowSummaryAfterCurrent = false;
             showAutomaticOpenSummary();
           } else {
-            scheduleNextAutoOpen({ keepExisting: false });
+            scheduleNextAutoOpen({ keepExisting: Boolean(detail.lockBusy) });
           }
           return;
         }

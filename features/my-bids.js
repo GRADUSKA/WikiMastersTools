@@ -9,11 +9,19 @@
       const SETTING_KEY = 'myBids';
 
       const SOUND_KEY = 'wm_my_bids_sound_v1';
-      const POLL_VISIBLE_MS = 7000;
+      // Le site tolère ~30 requêtes par minute pour tout l'onglet : un rafraîchissement toutes les 7 s
+      // en prenait un tiers au chargement des prix. Rythme rapide seulement quand une enchère va finir.
+      const POLL_VISIBLE_MS = 15000;
+      const POLL_URGENT_MS = 7000;
       const POLL_HIDDEN_MS = 20000;
+      const URGENT_WINDOW_MS = 2 * 60 * 1000;
       const BALANCE_REFRESH_MS = 60 * 1000;
+      const FETCH_TIMEOUT_MS = 10000;
+      const POLL_MAX_MS = 60000;
+      // Blocage vu ici : le chargement des prix (même clé) fait une courte pause lui aussi.
+      const SITE_BLOCK_MS = 15000;
 
-      const { readLocalValue, writeLocalValue } = runtime.core;
+      const { readLocalValue, writeLocalValue, PRICE_BLOCK_KEY } = runtime.core;
       const logic = runtime.myBidsLogic;
       const alerts = logic.createAlertTracker();
 
@@ -27,8 +35,51 @@
         soundOn: readLocalValue(SOUND_KEY) !== false,
         pending: new Set(),
         rowErrors: new Map(),
-        minHints: new Map()
+        minHints: new Map(),
+        // Enchère -> prix de notre dernière mise réussie : sans identifiant lu dans le cookie,
+        // c'est la seule façon de savoir qu'on mène encore et de ne pas surenchérir sur soi-même.
+        ownBids: new Map()
       };
+
+      function bidCard(bid) {
+        const id = bid?.card_id || bid?.card?.id;
+        const title = bid?.card?.wikipedia_title;
+        if (!id || !title) return null;
+        return {
+          id,
+          title,
+          rarity: bid.snapshot_rarity || bid.card?.rarity || null,
+          imageUrl: bid.card?.image_url || null,
+          count: 1
+        };
+      }
+
+      // Quelques cartes au plus : elles passent devant un chargement complet des prix en cours.
+      function loadBidPrices(bids) {
+        try {
+          const cards = bids.map(bidCard).filter(Boolean).map(runtime.core.preserveOwnedMeta);
+          runtime.priceLoader.loadCacheForCards(cards, { priority: true });
+        } catch (error) {
+          console.debug('[WM Average] prix des enchères', error);
+        }
+      }
+
+      function averageFor(bid) {
+        const card = bidCard(bid);
+        const entry = card ? runtime.core.cacheMemory.get(card.id) : null;
+        const average = entry ? runtime.priceUi.chooseAverage(entry, null, card.rarity) : null;
+        // 0 n'est pas une moyenne exploitable : toute mise serait « au-dessus ».
+        return Number.isFinite(average) && average > 0 ? average : null;
+      }
+
+      function learnUserId(bids) {
+        for (const bid of bids) {
+          if (state.ownBids.get(bid.id) === logic.currentPrice(bid) && bid.current_bidder_id) {
+            return bid.current_bidder_id;
+          }
+        }
+        return null;
+      }
 
       let running = false;
       let loading = false;
@@ -37,6 +88,7 @@
       let pollTimer = null;
       let tickTimer = null;
       let balanceAt = 0;
+      let errorStreak = 0;
       let audioContext = null;
 
       function el(tag, className, text) {
@@ -165,11 +217,16 @@
         const response = await fetch('/api/marketplace?page=1&limit=1&mine=1', {
           method: 'GET',
           credentials: 'include',
-          headers: { accept: '*/*' }
+          headers: { accept: '*/*' },
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
         });
 
-        if (response.status === 401 || response.status === 403) {
+        if (response.status === 401) {
           throw new Error('Session expirée, reconnecte-toi à WikiMasters.');
+        }
+        if (response.status === 403 || response.status === 429) {
+          writeLocalValue(PRICE_BLOCK_KEY, Math.max(siteBlockedUntil(), Date.now() + SITE_BLOCK_MS));
+          throw new Error(`Le site limite les requêtes (HTTP ${response.status}), nouvelle tentative plus tard.`);
         }
         if (!response.ok) throw new Error(`Actualisation impossible (HTTP ${response.status}).`);
 
@@ -183,7 +240,8 @@
           const response = await fetch('/api/wikibidous', {
             method: 'GET',
             credentials: 'include',
-            headers: { accept: '*/*' }
+            headers: { accept: '*/*' },
+            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
           });
           if (!response.ok) return;
 
@@ -211,15 +269,21 @@
           for (const id of state.minHints.keys()) {
             if (!ids.has(id)) state.minHints.delete(id);
           }
-          state.userId = logic.parseUserIdFromCookies(document.cookie);
+          state.userId = logic.parseUserIdFromCookies(document.cookie) || state.userId || learnUserId(bids);
+          for (const id of state.ownBids.keys()) {
+            if (!ids.has(id)) state.ownBids.delete(id);
+          }
           state.error = null;
+          errorStreak = 0;
           state.loaded = true;
           state.updatedAt = Date.now();
           checkAlerts();
+          loadBidPrices(bids);
 
           if (Date.now() - balanceAt > BALANCE_REFRESH_MS) refreshBalance();
         } catch (error) {
           state.error = String(error?.message || error);
+          errorStreak += 1;
         } finally {
           loading = false;
           try {
@@ -248,7 +312,8 @@
             method: 'POST',
             credentials: 'include',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ amount })
+            body: JSON.stringify({ amount }),
+            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
           });
 
           let json = null;
@@ -273,6 +338,8 @@
                 ? logic.applyBidResult(item, json, amount, state.userId)
                 : item
             );
+            const placed = state.bids.find((item) => item.id === auctionId);
+            if (placed) state.ownBids.set(auctionId, logic.currentPrice(placed));
 
             const balance = Number(json?.bidder_balance);
             if (Number.isFinite(balance)) state.balance = balance;
@@ -384,7 +451,8 @@
       function isBidDisabled(bid, remaining) {
         return state.pending.has(bid.id) ||
           remaining <= 0 ||
-          logic.bidStatus(bid, state.userId) === 'leading';
+          logic.bidStatus(bid, state.userId) === 'leading' ||
+          (!state.userId && state.ownBids.get(bid.id) === logic.currentPrice(bid));
       }
 
       function buildRow(bid) {
@@ -412,6 +480,8 @@
         else if (status === 'outbid') info.append(el('span', 'wm-bids-badge is-outbid', 'Dépassé'));
 
         const price = el('span', 'wm-bids-price', formatAmount(logic.currentPrice(bid)));
+        const average = averageFor(bid);
+        if (average != null) price.append(el('small', 'wm-bids-average', `Moy. ${formatAmount(Math.round(average))}`));
 
         const countdown = el('span', 'wm-bids-countdown', logic.formatRemaining(remaining));
         countdown.dataset.role = 'countdown';
@@ -422,6 +492,10 @@
         button.title = status === 'leading'
           ? 'Tu es déjà en tête'
           : `Miser ${formatAmount(nextAmount)}`;
+        if (average != null && nextAmount > average && status !== 'leading') {
+          button.classList.add('is-above-average');
+          button.title += ` — au-dessus du prix moyen (${formatAmount(Math.round(average))})`;
+        }
         button.setAttribute('aria-label', `Miser ${formatAmount(nextAmount)} sur ${bid.card?.wikipedia_title || 'cette carte'}`);
         button.addEventListener('click', () => placeBid(bid.id));
 
@@ -492,9 +566,27 @@
         updateSoundButton();
       }
 
+      function siteBlockedUntil() {
+        return Number(readLocalValue(PRICE_BLOCK_KEY)) || 0;
+      }
+
+      function hasUrgentBid() {
+        const now = Date.now();
+        return state.bids.some((bid) => {
+          const remaining = logic.remainingMs(bid, now);
+          return remaining > 0 && remaining < URGENT_WINDOW_MS;
+        });
+      }
+
       function schedulePoll() {
         clearTimeout(pollTimer);
         if (!running) return;
+
+        // Après des erreurs, on espace les requêtes au lieu de marteler un site qui bloque,
+        // et on attend la fin d'un blocage vu par le chargement des prix.
+        const base = hasUrgentBid() ? POLL_URGENT_MS : (document.hidden ? POLL_HIDDEN_MS : POLL_VISIBLE_MS);
+        const backoff = Math.min(POLL_MAX_MS, base * 2 ** Math.min(errorStreak, 3));
+        const blocked = Math.min(POLL_MAX_MS, Math.max(0, siteBlockedUntil() - Date.now()));
 
         pollTimer = setTimeout(async () => {
           try {
@@ -502,7 +594,7 @@
           } finally {
             schedulePoll();
           }
-        }, document.hidden ? POLL_HIDDEN_MS : POLL_VISIBLE_MS);
+        }, Math.max(backoff, blocked));
       }
 
       function onVisibilityChange() {
@@ -528,6 +620,14 @@
       function stop() {
         if (!running) return;
         running = false;
+
+        // Au retour sur la page, pas d'anciens montants avec des boutons « Miser » actifs,
+        // et une réponse arrivée après le départ ne doit ni s'afficher ni sonner.
+        bidGeneration += 1;
+        state.bids = [];
+        state.loaded = false;
+        state.rowErrors.clear();
+        state.minHints.clear();
 
         clearTimeout(pollTimer);
         clearInterval(tickTimer);
@@ -579,7 +679,21 @@
         ensurePage();
       }
 
-      return { render, isBidsPage };
+      // Plusieurs prix arrivent dans la même rafale (une carte par enchère) : un seul rendu, différé
+      // d'un micro-tick, au lieu de reconstruire la liste une fois par carte — ça coupait aussi un
+      // clic sur « Miser » si son relâchement tombait pendant la reconstruction.
+      let priceUpdateScheduled = false;
+
+      function onPriceUpdated(id) {
+        if (!running || priceUpdateScheduled || !state.bids.some((bid) => bidCard(bid)?.id === id)) return;
+        priceUpdateScheduled = true;
+        Promise.resolve().then(() => {
+          priceUpdateScheduled = false;
+          if (running) renderList();
+        });
+      }
+
+      return { render, isBidsPage, onPriceUpdated };
     }
   };
 })();

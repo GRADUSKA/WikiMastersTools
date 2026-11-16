@@ -5,8 +5,15 @@
     create(runtime) {
       const {
         originalFetch, MAX_COLLECTION_PAGES, RARITY_ORDER,
-        extractCards, fetchJsonRetry, mapTags
+        extractCards, fetchJsonRetry, mapTags, sleep
       } = runtime.core;
+
+      // Pause entre deux pages : ~120 requêtes d'affilée déclenchent le 403 du site.
+      const PAGE_DELAY_MS = 250;
+
+      // Taille de page renvoyée par le serveur, avant que extractCards n'écarte
+      // les entrées sans titre. Sinon une seule carte sans titre fausse tout le calcul.
+      const rawLength = (json) => (Array.isArray(json?.collection) ? json.collection.length : 0);
 
       function extractRarityCounts(json) {
         if (!json || typeof json !== 'object') return null;
@@ -77,7 +84,7 @@
         return fetchJsonRetry(
           `/api/my-collection?sort=${encodeURIComponent(sort)}${tagQuery}&page=${encodeURIComponent(page)}&stats=${stats ? 1 : 0}`,
           { method: 'GET', credentials: 'include', headers: { accept: '*/*' } },
-          { label: `Collection page ${page}`, maxAttempts: 3, timeoutMs: 15000 }
+          { label: `Collection page ${page}`, maxAttempts: 3, timeoutMs: 60000 }
         );
       }
 
@@ -126,7 +133,7 @@
           const first = await fetchCollectionPage(0, false, { tagId });
           const firstCards = extractCards(first);
           const total = Number(first?.total);
-          const pageSize = firstCards.length;
+          const pageSize = rawLength(first);
           const pages = [firstCards];
 
           const hasReliableTotal = Number.isFinite(total) && total > 0 && pageSize > 0;
@@ -139,10 +146,11 @@
           // (50 cartes) : on continue jusqu'à la première page incomplète/vide.
           if (pageSize > 0) {
             for (let page = 1; page < maxPageExclusive; page += 1) {
-              const cards = extractCards(await fetchCollectionPage(page, false, { tagId }));
-              pages.push(cards);
+              await sleep(PAGE_DELAY_MS);
+              const json = await fetchCollectionPage(page, false, { tagId });
+              pages.push(extractCards(json));
 
-              if (!cards.length || cards.length < pageSize) break;
+              if (rawLength(json) < pageSize) break;
             }
           }
 
@@ -174,12 +182,14 @@
           let pageSize = 0;
 
           for (let page = 0; page < MAX_COLLECTION_PAGES; page += 1) {
-            const cards = extractCards(await fetchCollectionPage(page, false, { sort: 'starred' }));
+            if (page > 0) await sleep(PAGE_DELAY_MS);
+            const json = await fetchCollectionPage(page, false, { sort: 'starred' });
+            const cards = extractCards(json);
             const starred = cards.filter((card) => card.starred);
             pages.push(starred);
 
-            if (page === 0) pageSize = cards.length;
-            if (!cards.length || starred.length < cards.length || cards.length < pageSize) break;
+            if (page === 0) pageSize = rawLength(json);
+            if (!cards.length || starred.length < cards.length || rawLength(json) < pageSize) break;
           }
 
           window.dispatchEvent(new CustomEvent('wm-average-starred-cards', {
@@ -237,8 +247,9 @@
           const first = await fetchCollectionPage(0, true);
           const firstCards = extractCards(first);
           const total = typeof first?.total === 'number' ? first.total : Number.NaN;
-          const pageSize = firstCards.length;
+          const pageSize = rawLength(first);
           const pages = [firstCards];
+          let partialError = null;
 
           let totalPages = 1;
           if (Number.isFinite(total) && total > 0 && pageSize > 0) {
@@ -248,7 +259,10 @@
           let targetPages = totalPages;
           let exactTargetFromStats = false;
 
-          if (rarityCounts && pageSize > 0 && selectedIndexes.length) {
+          // Les stats ne servent qu'à s'arrêter avant les raretés non demandées.
+          // Avec « C » cochée il faut toutes les pages : on ne se fie pas à leur somme.
+          if (rarityCounts && pageSize > 0 && selectedIndexes.length &&
+              lowestRequestedIndex < RARITY_ORDER.length - 1) {
             let cardsThroughLowestRarity = 0;
 
             for (let index = 0; index <= lowestRequestedIndex; index += 1) {
@@ -293,7 +307,18 @@
                   : MAX_COLLECTION_PAGES);
 
             for (let page = 1; page < maxPageExclusive; page += 1) {
-              const json = await fetchCollectionPage(page, false);
+              await sleep(PAGE_DELAY_MS);
+
+              let json;
+              try {
+                json = await fetchCollectionPage(page, false);
+              } catch (error) {
+                // Garder les pages déjà lues plutôt que tout perdre sur une erreur tardive.
+                partialError = String(error?.message || error);
+                stoppedEarly = true;
+                break;
+              }
+
               const cards = extractCards(json);
               pages[page] = cards;
               loadedPages += 1;
@@ -312,7 +337,7 @@
                 break;
               }
 
-              if (cards.length < pageSize) break;
+              if (rawLength(json) < pageSize) break;
             }
           }
 
@@ -333,6 +358,7 @@
               cards: [...deduped.values()],
               total: Number.isFinite(total) ? total : deduped.size,
               complete,
+              partialError,
               loadedPages,
               totalPages: exactTargetFromStats ? targetPages : totalPages,
               usedRarityStats: exactTargetFromStats

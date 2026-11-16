@@ -13,5 +13,4 @@
   runtime.marketplace = registry.bridgeMarketplace.create(runtime);
   runtime.prices = registry.bridgePrices.create(runtime);
 
-  console.debug('[WM Average] bridge modulaire v4.2.0 installé');
 })();

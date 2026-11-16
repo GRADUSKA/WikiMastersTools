@@ -18,6 +18,7 @@
     'packs',
     'ranking',
     'collectionBulk',
+    'gifView',
     'extraTools',
     'themeTracker',
     'myBidsLogic',
@@ -69,7 +70,14 @@
     readLocalValue: runtime.core.readLocalValue,
     writeLocalValue: runtime.core.writeLocalValue,
     isPullsPage: runtime.core.isPullsPage,
-    isFeatureEnabled: runtime.settings.isEnabled
+    isFeatureEnabled: runtime.settings.isEnabled,
+    // Un prix expiré ne doit pas valoriser un paquet : la vraie valeur arrive avec le rafraîchissement.
+    priceEntry: (id) => {
+      const entry = runtime.core.cacheMemory.get(id) || runtime.core.readLocalValue(runtime.core.cacheKey(id));
+      return runtime.core.isCacheEntryValid(entry) ? entry : undefined;
+    },
+    chooseAverage: runtime.priceUi.chooseAverage,
+    formatAverage: runtime.priceUi.formatAverage
   });
 
   runtime.compactMode = featureRegistry.compactMode.create({
@@ -90,17 +98,18 @@
     renderCollectionCard: runtime.priceUi.renderCollectionCard,
     reportError: runtime.core.reportError,
     loadCacheForCards: runtime.priceLoader.loadCacheForCards,
-    createSponsorNote: runtime.core.createSponsorNote,
     formatAverage: runtime.priceUi.formatAverage,
     chooseAverage: runtime.priceUi.chooseAverage,
     registerCards: runtime.core.registerCards,
-    isFeatureEnabled: runtime.settings.isEnabled
+    isFeatureEnabled: runtime.settings.isEnabled,
+    currentUserId: () => runtime.myBidsLogic?.parseUserIdFromCookies(document.cookie) || null
   });
 
   runtime.modalUi = featureRegistry.modalUi.create();
   runtime.packs = featureRegistry.packs.create(runtime);
   runtime.ranking = featureRegistry.ranking.create(runtime);
   runtime.collectionBulk = featureRegistry.collectionBulk.create(runtime);
+  runtime.gifView = featureRegistry.gifView.create(runtime);
   runtime.extraTools = featureRegistry.extraTools.create(runtime);
   runtime.themeTracker = featureRegistry.themeTracker.create(runtime);
   runtime.myBidsLogic = featureRegistry.myBidsLogic.create();
@@ -108,5 +117,4 @@
   runtime.app = featureRegistry.app.create(runtime);
 
   runtime.app.startObserver();
-  console.debug('[WM Average] runtime modulaire v4.15.1 chargé');
 })();

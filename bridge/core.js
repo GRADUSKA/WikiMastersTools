@@ -1,6 +1,55 @@
 (() => {
   const registry = window.__wmBridgeFeatures ||= {};
 
+  // Chrome ralentit les minuteurs d'un onglet masqué (jusqu'à un par minute après 5 min) ; ceux d'un
+  // Worker ne le sont pas. Sans Worker (ou s'il échoue), on retombe sur setTimeout.
+  registry.timer ||= (() => {
+    const WORKER_SOURCE = 'const t=new Map();onmessage=e=>{const{id,ms}=e.data;clearTimeout(t.get(id));t.delete(id);'
+      + 'if(ms!=null)t.set(id,setTimeout(()=>{t.delete(id);postMessage(id)},ms))}';
+    const pending = new Map();
+    let worker;
+    let seq = 0;
+
+    function degrade() {
+      worker = null;
+      for (const { fn, at } of pending.values()) setTimeout(fn, Math.max(0, at - Date.now()));
+      pending.clear();
+    }
+
+    function getWorker() {
+      if (worker !== undefined) return worker;
+      try {
+        worker = new Worker(URL.createObjectURL(new Blob([WORKER_SOURCE], { type: 'text/javascript' })));
+        worker.onmessage = (event) => {
+          const entry = pending.get(event.data);
+          pending.delete(event.data);
+          entry?.fn();
+        };
+        worker.onerror = degrade;
+      } catch (_) {
+        worker = null;
+      }
+      return worker;
+    }
+
+    function set(fn, ms) {
+      const target = getWorker();
+      if (!target) return setTimeout(fn, ms);
+      const id = `w${++seq}`;
+      pending.set(id, { fn, at: Date.now() + ms });
+      target.postMessage({ id, ms });
+      return id;
+    }
+
+    function clear(id) {
+      if (typeof id !== 'string') return clearTimeout(id);
+      pending.delete(id);
+      worker?.postMessage({ id });
+    }
+
+    return { set, clear, sleep: (ms) => new Promise((resolve) => set(resolve, ms)) };
+  })();
+
   registry.bridgeCore = {
     create() {
       const originalFetch = window.fetch.bind(window);
@@ -8,8 +57,6 @@
       const MAX_BULK_PACKS = 100;
       const RARITY_ORDER = ['L', 'UR', 'SR', 'R', 'PC', 'C'];
       const MARKETPLACE_MINE_CACHE_TTL = 15 * 1000;
-      let globalCardsRequestTemplate = null;
-      let supabaseRequestTemplate = null;
 
       // Étiquettes normalisées en { id, name, color }, dédoublonnées par id (ou par nom à défaut).
       function mapTags(...lists) {
@@ -91,20 +138,20 @@
         }
       }
 
-      function isTradesApi(url) {
+      // Liste des annonces affichée par le site ; « mine=1 » est la requête de « Mes enchères ».
+      function isMarketplaceListApi(url) {
         try {
           const parsed = new URL(url, location.origin);
-          return parsed.pathname === '/api/trades';
+          return parsed.pathname === '/api/marketplace' && !parsed.searchParams.has('mine');
         } catch (_) {
           return false;
         }
       }
 
-      function isSupabaseRestApi(url) {
+      function isTradesApi(url) {
         try {
           const parsed = new URL(url, location.origin);
-          return parsed.hostname === 'cyrxjeppjqsxxjayfrur.supabase.co' &&
-            parsed.pathname.startsWith('/rest/v1/');
+          return parsed.pathname === '/api/trades';
         } catch (_) {
           return false;
         }
@@ -118,94 +165,6 @@
         } catch (_) {
           return false;
         }
-      }
-
-      function headersToObject(headers) {
-        const result = {};
-        if (!headers) return result;
-        try {
-          new Headers(headers).forEach((value, key) => {
-            result[key] = value;
-          });
-        } catch (_) {}
-        return result;
-      }
-
-      function captureSupabaseRequest(input, init = {}) {
-        try {
-          const url = typeof input === 'string' ? input : input?.url;
-          if (!url || !isSupabaseRestApi(url)) return;
-
-          const headers = {
-            ...headersToObject(input?.headers),
-            ...headersToObject(init?.headers)
-          };
-
-          supabaseRequestTemplate = { url: String(url), headers };
-        } catch (_) {}
-      }
-
-      function getSupabaseRequestTemplate() {
-        if (!supabaseRequestTemplate) return null;
-        return {
-          url: supabaseRequestTemplate.url,
-          headers: { ...(supabaseRequestTemplate.headers || {}) }
-        };
-      }
-
-      function captureGlobalCardsRequest(input, init = {}) {
-        try {
-          const url = typeof input === 'string' ? input : input?.url;
-          if (!url || !isGlobalCardsApi(url)) return;
-
-          const headers = {
-            ...headersToObject(input?.headers),
-            ...headersToObject(init?.headers)
-          };
-
-          globalCardsRequestTemplate = { url: String(url), headers };
-        } catch (_) {}
-      }
-
-      function getGlobalCardsRequestTemplate() {
-        if (!globalCardsRequestTemplate) return null;
-        return {
-          url: globalCardsRequestTemplate.url,
-          headers: { ...(globalCardsRequestTemplate.headers || {}) }
-        };
-      }
-
-      function extractGlobalCards(json) {
-        const rows = Array.isArray(json)
-          ? json
-          : Array.isArray(json?.data)
-            ? json.data
-            : [];
-
-        return rows.map((card) => {
-          if (!card?.id || !card?.wikipedia_title) return null;
-          return {
-            id: card.id,
-            title: card.wikipedia_title,
-            rarity: card.rarity || null,
-            imageUrl: card.image_url || null,
-            wikipediaUrl: card.wikipedia_url || null,
-            summary: typeof card.summary === 'string'
-              ? card.summary
-              : card.summary
-                ? JSON.stringify(card.summary)
-                : '',
-            count: 1
-          };
-        }).filter(Boolean);
-      }
-
-      function emitGlobalCatalogue(json) {
-        const cards = extractGlobalCards(json);
-        if (!cards.length) return;
-        window.dispatchEvent(new CustomEvent('wm-average-global-catalogue', {
-          detail: { cards }
-        }));
       }
 
       function getGlobalCollectionSummaryCardId(url) {
@@ -341,6 +300,34 @@
         }
       }
 
+      // La forme exacte de la liste n'est pas documentée : on prend le premier tableau d'annonces trouvé.
+      function emitMarketplaceList(json) {
+        const isAuction = (item) => item && typeof item === 'object' && (item.card_id || item.card?.id);
+        const source = Array.isArray(json)
+          ? json
+          : Object.values(json || {}).find((value) => Array.isArray(value) && value.some(isAuction));
+        if (!Array.isArray(source)) return;
+
+        const auctions = source.filter(isAuction).map((auction) => {
+          const price = [auction.effective_bid, auction.current_bid, auction.listing_base_amount, auction.base_amount]
+            .map(Number)
+            .find((value) => Number.isFinite(value) && value > 0) || 0;
+          return {
+            id: auction.id || null,
+            price,
+            card: {
+              id: auction.card_id || auction.card?.id,
+              title: auction.card?.wikipedia_title || null,
+              rarity: auction.snapshot_rarity || auction.card?.rarity || null,
+              imageUrl: auction.card?.image_url || null
+            }
+          };
+        }).filter((auction) => auction.id && auction.card.id && auction.card.title);
+
+        if (!auctions.length) return;
+        window.dispatchEvent(new CustomEvent('wm-average-marketplace-list', { detail: { auctions } }));
+      }
+
       function emitMarketplaceDetail(json) {
         const auction = json?.auction;
         const card = auction?.card;
@@ -363,6 +350,13 @@
         }));
       }
 
+      const { sleep } = registry.timer;
+
+      // 403 et 429 : le site (ou son pare-feu) limite le débit, une pause suffit souvent.
+      const isThrottleStatus = (status) => status === 403 || status === 429;
+      const isRetryableStatus = (status) =>
+        isThrottleStatus(status) || status === 408 || (status >= 500 && status <= 599);
+
       async function fetchJsonRetry(url, options = {}, {
         label = 'Requête',
         maxAttempts = 3,
@@ -373,6 +367,7 @@
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
           const controller = new AbortController();
           const timeout = setTimeout(() => controller.abort(), timeoutMs);
+          let delayMs = Math.min(1800, 300 * (2 ** (attempt - 1)));
           try {
             const response = await originalFetch(url, { ...options, signal: options.signal || controller.signal });
 
@@ -380,18 +375,28 @@
               return await response.json();
             }
 
-            const retryable = response.status >= 500 && response.status <= 599;
             lastError = new Error(`${label}: HTTP ${response.status}`);
+            lastError.status = response.status;
 
-            if (!retryable || attempt >= maxAttempts) {
+            if (!isRetryableStatus(response.status) || attempt >= maxAttempts) {
               throw lastError;
             }
-          } catch (error) {
-            lastError = error;
 
-            const statusMatch = String(error?.message || '').match(/HTTP\s+(\d+)/);
-            const status = statusMatch ? Number(statusMatch[1]) : null;
-            const retryable = status == null || (status >= 500 && status <= 599);
+            if (isThrottleStatus(response.status)) {
+              const retryAfterMs = Number(response.headers.get('Retry-After')) * 1000 || 0;
+              delayMs = Math.min(30000, Math.max(retryAfterMs, 3000 * attempt));
+            }
+          } catch (rawError) {
+            // Sans réponse dans le délai, le site traîne, souvent parce qu'il nous freine.
+            const timedOut = !options.signal && rawError?.name === 'AbortError';
+            const error = timedOut
+              ? new Error(`${label}: pas de réponse en ${Math.round(timeoutMs / 1000)} s`)
+              : rawError;
+            lastError = error;
+            if (timedOut) delayMs = Math.min(30000, 3000 * attempt);
+
+            const status = Number.isFinite(error?.status) ? error.status : null;
+            const retryable = status == null || isRetryableStatus(status);
 
             if (!retryable || attempt >= maxAttempts) {
               throw error;
@@ -400,8 +405,7 @@
             clearTimeout(timeout);
           }
 
-          const delayMs = Math.min(1800, 300 * (2 ** (attempt - 1)));
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          await sleep(delayMs);
         }
 
         throw lastError || new Error(`${label}: erreur inconnue`);
@@ -411,13 +415,10 @@
       return {
         originalFetch, MAX_COLLECTION_PAGES, MAX_BULK_PACKS, RARITY_ORDER,
         MARKETPLACE_MINE_CACHE_TTL, mapTags, mapEntry, extractCards, emitCollection,
-        isMarketplaceDetailApi, isPacksOpenApi, isTradesApi,
-        isSupabaseRestApi, captureSupabaseRequest, getSupabaseRequestTemplate,
-        isGlobalCardsApi, captureGlobalCardsRequest, getGlobalCardsRequestTemplate,
-        extractGlobalCards, emitGlobalCatalogue,
-        getGlobalCollectionSummaryCardId, emitGlobalCollectionInspectedCard,
+        isMarketplaceDetailApi, isMarketplaceListApi, isPacksOpenApi, isTradesApi,
+        isGlobalCardsApi, getGlobalCollectionSummaryCardId, emitGlobalCollectionInspectedCard,
         mapPackCards, emitPackOpened, mapTrade, emitTrades, fetchTrades,
-        emitMarketplaceDetail, fetchJsonRetry
+        emitMarketplaceDetail, emitMarketplaceList, fetchJsonRetry, sleep
       };
     }
   };

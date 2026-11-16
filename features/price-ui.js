@@ -4,9 +4,9 @@
   registry.priceUi = {
     create(runtime) {
       const {
-        isCollectionPage, isMarketplaceDetailPage, isGlobalCollectionPage,
+        isCollectionPage, isMarketplaceDetailPage, isMarketplacePage, isGlobalCollectionPage,
         normalizeTitle, cacheKey, storageGet, isCacheEntryValid, reportError,
-        registerCards, createSponsorNote, cardMetaById, idByTitle, cacheMemory
+        registerCards, preserveOwnedMeta, cardMetaById, idByTitle, cacheMemory
       } = runtime.core;
 
       let collectionPriceObserver = null;
@@ -26,20 +26,57 @@
         return null;
       }
 
+      // Créer un formateur coûte ~40 fois plus que s'en servir : on les garde.
+      const wholeFormat = new Intl.NumberFormat('fr-FR', { maximumFractionDigits: 0 });
+      const decimalFormat = new Intl.NumberFormat('fr-FR', { maximumFractionDigits: 2 });
+
       function formatAverage(value) {
         const n = Number(value);
         if (!Number.isFinite(n)) return '—';
-        return new Intl.NumberFormat('fr-FR', {
-          maximumFractionDigits: Number.isInteger(n) ? 0 : 2
-        }).format(n);
+        return (Number.isInteger(n) ? wholeFormat : decimalFormat).format(n);
+      }
+
+      // Le chargement en masse appelle findCardByTitle des milliers de fois dans la même tâche :
+      // l'index des titres affichés n'est construit qu'une fois, puis jeté à la fin de la tâche.
+      let h3ByTitle = null;
+
+      function indexH3ByTitle() {
+        if (h3ByTitle) return h3ByTitle;
+
+        h3ByTitle = new Map();
+        for (const h3 of document.querySelectorAll('h3')) {
+          const key = normalizeTitle(h3.textContent);
+          const list = h3ByTitle.get(key);
+          if (list) list.push(h3);
+          else h3ByTitle.set(key, [h3]);
+        }
+
+        Promise.resolve().then(() => { h3ByTitle = null; });
+        return h3ByTitle;
+      }
+
+      // Même principe pour les cartes déjà reliées à un id : une recherche dans toute la page
+      // par carte coûtait ~21 000 requêtes DOM au lancement d'un chargement complet.
+      let cardsById = null;
+
+      function indexCardsById() {
+        if (cardsById) return cardsById;
+
+        cardsById = new Map();
+        for (const card of document.querySelectorAll('[data-wm-card-id]')) {
+          const list = cardsById.get(card.dataset.wmCardId);
+          if (list) list.push(card);
+          else cardsById.set(card.dataset.wmCardId, [card]);
+        }
+
+        Promise.resolve().then(() => { cardsById = null; });
+        return cardsById;
       }
 
       function findCardByTitle(title) {
         if (!isCollectionPage()) return null;
 
-        const target = normalizeTitle(title);
-        for (const h3 of document.querySelectorAll('h3')) {
-          if (normalizeTitle(h3.textContent) !== target) continue;
+        for (const h3 of indexH3ByTitle().get(normalizeTitle(title)) || []) {
           const card = h3.closest('div[class*="rounded-2xl"][class*="overflow-hidden"][class*="cursor-pointer"]');
           if (card) return card;
         }
@@ -125,7 +162,7 @@
           return;
         }
 
-        badge.title = 'Prix moyen des ventes (cache 24 h)';
+        if (badge.title !== 'Prix moyen des ventes') badge.title = 'Prix moyen des ventes';
         const average = chooseAverage(cacheEntry, card, getRarityFromCard(card) || cardMetaById.get(id)?.rarity || null);
 
         if (average == null) {
@@ -194,7 +231,10 @@
       function bindCollectionCardElement(id, h3, card) {
         if (!id || !card) return;
 
-        card.dataset.wmCardId = id;
+        if (card.dataset.wmCardId !== id) {
+          card.dataset.wmCardId = id;
+          if (cardsById) cardsById.set(id, [...(cardsById.get(id) || []), card]);
+        }
         if (h3) h3.dataset.wmCardBound = '1';
 
         renderCollectionCard(id, card);
@@ -207,7 +247,7 @@
       function renderOne(id) {
         if (!isCollectionPage()) return;
 
-        const direct = document.querySelectorAll(`[data-wm-card-id="${CSS.escape(id)}"]`);
+        const direct = (indexCardsById().get(id) || []).filter((card) => card.dataset.wmCardId === id);
         if (direct.length) {
           for (const card of direct) renderCollectionCard(id, card);
           return;
@@ -298,7 +338,7 @@
           value.dataset.role = 'value';
 
           priceCard.append(labelWrap, value);
-          wrap.append(priceCard, createSponsorNote());
+          wrap.append(priceCard);
           titleBlock.insertAdjacentElement('afterend', wrap);
         }
 
@@ -331,11 +371,112 @@
         valueEl.textContent = average == null ? '—' : `${formatAverage(average)} W`;
       }
 
+      // Annonces vues dans la liste du Marketplace, par id d'enchère.
+      const marketplaceListings = new Map();
+      const marketplaceCardIds = new Set();
+      const MARKET_RARE_RARITIES = new Set(['L', 'UR', 'SR']);
+      const MARKET_MAX_LOADS = 20;
+      const AUCTION_ID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+      function marketplaceDealsVisible() {
+        // « Mes enchères » masque la page Marketplace en CSS sur cette même URL, mais le site
+        // continue d'en charger la liste en arrière-plan : elle ne doit pas être traitée ici.
+        return runtime.settings.isEnabled('marketplaceDeals') && isMarketplacePage() && !isMarketplaceDetailPage() &&
+          !runtime.myBids?.isBidsPage();
+      }
+
+      // Plusieurs annonces peuvent porter le même titre : l'écart n'est affiché que si l'annonce
+      // est identifiée (lien vers l'enchère, rareté affichée unique parmi elles, ou titre unique).
+      function renderMarketplaceDeals() {
+        if (!marketplaceDealsVisible()) {
+          document.querySelectorAll('.wm-market-deal').forEach((badge) => badge.remove());
+          return;
+        }
+        if (!marketplaceListings.size) return;
+
+        const byTitle = new Map();
+        for (const listing of marketplaceListings.values()) {
+          const key = normalizeTitle(listing.card.title);
+          byTitle.set(key, [...(byTitle.get(key) || []), listing]);
+        }
+
+        for (const cardEl of document.querySelectorAll('div[class*="glow-"]')) {
+          const h3 = cardEl.querySelector('h3');
+          const listings = h3 ? byTitle.get(normalizeTitle(h3.textContent)) : null;
+          if (!listings) continue;
+
+          const linkedId = cardEl.closest('a[href*="/marketplace/"]')?.getAttribute('href')?.match(AUCTION_ID_PATTERN)?.[0];
+          const byRarity = listings.filter((item) => item.card.rarity === getRarityFromCard(cardEl));
+          const listing = listings.find((item) => item.id === linkedId) ||
+            (byRarity.length === 1 ? byRarity[0] : null) ||
+            (listings.length === 1 ? listings[0] : null);
+          let badge = cardEl.querySelector('.wm-market-deal');
+          if (!listing) {
+            badge?.remove();
+            continue;
+          }
+          const { card } = listing;
+          const entry = cacheMemory.get(card.id);
+          const average = entry ? chooseAverage(entry, null, card.rarity) : null;
+
+          if (!Number.isFinite(average) || average <= 0) {
+            badge?.remove();
+            continue;
+          }
+
+          let text = `Moy. ${formatAverage(Math.round(average))} W`;
+          let state = '';
+          if (listing?.price > 0) {
+            const diff = Math.round((listing.price - average) / average * 100);
+            text += ` · ${diff > 0 ? '+' : diff < 0 ? '−' : ''}${Math.abs(diff)} %`;
+            state = diff <= -20 ? 'is-deal' : diff >= 20 ? 'is-expensive' : '';
+          }
+
+          if (!badge) {
+            badge = document.createElement('div');
+            h3.insertAdjacentElement('afterend', badge);
+          }
+          const className = `wm-market-deal ${state}`.trim();
+          if (badge.className !== className) badge.className = className;
+          if (badge.textContent !== text) badge.textContent = text;
+          badge.title = 'Prix moyen des ventes et écart avec le prix actuel de l’annonce';
+        }
+      }
+
+      window.addEventListener('wm-average-marketplace-list', (event) => {
+        // Autrement, une recherche de carte par Familles ou tout autre appel à /api/marketplace
+        // déclencherait aussi des requêtes de prix prioritaires, hors de la page Marketplace.
+        if (!marketplaceDealsVisible()) return;
+        const auctions = Array.isArray(event.detail?.auctions) ? event.detail.auctions : [];
+        if (!auctions.length) return;
+
+        for (const auction of auctions) {
+          marketplaceListings.set(auction.id, auction);
+          marketplaceCardIds.add(auction.card.id);
+        }
+
+        const cards = [...new Map(auctions.map(({ card }) => [card.id, preserveOwnedMeta(card)])).values()];
+
+        try {
+          registerCards(cards);
+          hydrateCacheForCards(cards);
+          const missing = cards
+            .filter((card) => !cacheMemory.has(card.id) && MARKET_RARE_RARITIES.has(card.rarity))
+            .slice(0, MARKET_MAX_LOADS);
+          if (missing.length) runtime.priceLoader.loadCacheForCards(missing, { priority: true });
+          renderMarketplaceDeals();
+        } catch (error) {
+          reportError('bonnes affaires', error);
+        }
+      });
+
       function renderKnownCard(id) {
         renderOne(id);
         renderMarketplaceAverage(id);
+        if (marketplaceCardIds.has(id) && marketplaceDealsVisible()) renderMarketplaceDeals();
 
         runtime.packs?.onPriceUpdated(id);
+        runtime.myBids?.onPriceUpdated(id);
         runtime.trades?.renderTradeDetailCard(id);
 
         if (id === globalCollectionCardId) {
@@ -452,7 +593,7 @@
         renderMarketplaceAverage(card.id);
 
         try {
-          runtime.priceLoader.loadCacheForCards([card]);
+          runtime.priceLoader.loadCacheForCards([card], { priority: true });
         } catch (error) {
           reportError('marketplace', error);
         }
@@ -461,8 +602,6 @@
       window.addEventListener('wm-average-collection', (event) => {
         const cards = event.detail?.cards;
         if (!Array.isArray(cards) || !cards.length) return;
-
-        console.debug(`[WM Average] ${cards.length} cartes détectées`, cards);
 
         try {
           registerCards(cards);
@@ -516,7 +655,7 @@
       return {
         getRarityFromCard, formatAverage, chooseAverage, renderCollectionCard,
         hydrateCacheForCards, renderVisibleCollectionCards, renderMarketplaceAverage,
-        renderMarketplaceCurrent, renderKnownCard, renderGlobalCollectionInspectedCard,
+        renderMarketplaceCurrent, renderMarketplaceDeals, renderKnownCard, renderGlobalCollectionInspectedCard,
         ensureGlobalCollectionInspectedCard
       };
     }

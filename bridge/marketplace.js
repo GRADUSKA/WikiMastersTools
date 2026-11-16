@@ -5,7 +5,7 @@
     create(runtime) {
       const {
         originalFetch, MAX_COLLECTION_PAGES, MARKETPLACE_MINE_CACHE_TTL,
-        fetchJsonRetry, extractCards, emitMarketplaceDetail
+        fetchJsonRetry, extractCards, emitMarketplaceDetail, sleep
       } = runtime.core;
 
       let marketplaceMineCache = {
@@ -16,6 +16,8 @@
 
       // Exemplaires vus en favori lors de la dernière recherche de copies.
       const starredOwnedCardIds = new Set();
+      // Une seule mise en vente à la fois par carte, même depuis un classement rouvert.
+      const listingsInFlight = new Set();
 
       function createSaleError(message, code) {
         const error = new Error(message);
@@ -70,44 +72,21 @@
         let totalPages = 1;
 
         while (page < Math.min(totalPages, MAX_COLLECTION_PAGES)) {
-          let attempt = 0;
-          let json = null;
+          if (page > 0) await sleep(250);
 
-          while (true) {
-            attempt += 1;
-
-            try {
-              const response = await originalFetch(
-                `/api/my-collection?sort=rarity&q=${encodeURIComponent(query)}&page=${page}&stats=${page === 0 ? 1 : 0}`,
-                {
-                  method: 'GET',
-                  credentials: 'include',
-                  headers: { accept: '*/*' }
-                }
-              );
-
-              if (response.ok) {
-                json = await response.json();
-                break;
-              }
-
-              if (response.status < 500 || response.status > 599) {
-                throw createSaleError(
-                  `Recherche copie: HTTP ${response.status}`,
-                  'OWNERSHIP_LOOKUP_FAILED'
-                );
-              }
-            } catch (error) {
-              if (error?.code) throw error;
-
-              const statusMatch = String(error?.message || '').match(/HTTP\s+(\d+)/);
-              const status = statusMatch ? Number(statusMatch[1]) : null;
-              const retryable = status == null || (status >= 500 && status <= 599);
-              if (!retryable) throw error;
-            }
-
-            const delayMs = Math.min(5000, 500 * (2 ** Math.min(attempt - 1, 4)));
-            await new Promise((resolve) => setTimeout(resolve, delayMs));
+          let json;
+          try {
+            json = await fetchJsonRetry(
+              `/api/my-collection?sort=rarity&q=${encodeURIComponent(query)}&page=${page}&stats=${page === 0 ? 1 : 0}`,
+              {
+                method: 'GET',
+                credentials: 'include',
+                headers: { accept: '*/*' }
+              },
+              { label: 'Recherche copie', maxAttempts: 4 }
+            );
+          } catch (error) {
+            throw createSaleError(String(error?.message || error), 'OWNERSHIP_LOOKUP_FAILED');
           }
 
           const cards = extractCards(json);
@@ -124,7 +103,7 @@
 
           if (page === 0) {
             const total = Number(json?.total);
-            const pageSize = cards.length;
+            const pageSize = Array.isArray(json?.collection) ? json.collection.length : 0;
             totalPages =
               Number.isFinite(total) && total > 0 && pageSize > 0
                 ? Math.max(1, Math.ceil(total / pageSize))
@@ -254,6 +233,24 @@
         }
       });
 
+      // « Plus chères » : marque à l'avance les cartes déjà en vente, au lieu de l'apprendre
+      // seulement après un clic sur « Vendre » qui échoue.
+      window.addEventListener('wm-average-load-my-listings', async (event) => {
+        const requestId = event.detail?.requestId;
+        if (!requestId) return;
+
+        try {
+          const mine = await fetchMarketplaceMine(false);
+          window.dispatchEvent(new CustomEvent('wm-average-my-listings', {
+            detail: { requestId, ok: true, text: mine.text || '' }
+          }));
+        } catch (error) {
+          window.dispatchEvent(new CustomEvent('wm-average-my-listings', {
+            detail: { requestId, ok: false, error: String(error?.message || error) }
+          }));
+        }
+      });
+
       window.addEventListener('wm-average-create-listing', async (event) => {
         const {
           requestId,
@@ -281,6 +278,19 @@
           }));
           return;
         }
+
+        if (listingsInFlight.has(catalogueCardId)) {
+          window.dispatchEvent(new CustomEvent('wm-average-create-listing-result', {
+            detail: {
+              requestId,
+              catalogueCardId,
+              ok: false,
+              error: 'Une mise en vente de cette carte est déjà en cours.'
+            }
+          }));
+          return;
+        }
+        listingsInFlight.add(catalogueCardId);
 
         let resolvedOwnedCardId = ownedCardId || null;
         let staleOwnedCardId = null;
@@ -323,9 +333,9 @@
               title,
               new Set(staleOwnedCardId ? [staleOwnedCardId] : [])
             );
-
-            if (needsStarredConfirmation()) return;
           }
+
+          if (needsStarredConfirmation()) return;
 
           let { response, json } = await submitMarketplaceListing(
             resolvedOwnedCardId,
@@ -407,6 +417,8 @@
               error: String(error?.message || error)
             }
           }));
+        } finally {
+          listingsInFlight.delete(catalogueCardId);
         }
       });
 

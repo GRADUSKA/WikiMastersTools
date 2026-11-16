@@ -5,8 +5,13 @@
     create(runtime) {
       const {
         ALL_COLLECTION_KEY, cardMetaById, cacheMemory, cacheKey,
-        storageGet, storageSet, mergeTags
+        storageGet, storageSet, collectionReady, readCollection, mergeTags,
+        readLocalValue, writeLocalValue, RARITIES, isGifImage
       } = runtime.core;
+      // Illustration du site uniquement : celle que tous les joueurs voient.
+      const isGifCard = (card) => isGifImage(card.imageUrl);
+      const SALE_SETTINGS_KEY = 'wm_ranking_sale_v1';
+      const COLLECTION_VALUE_KEY = 'wm_collection_value_v1';
       const { formatAverage, chooseAverage } = runtime.priceUi;
       const pendingMarketplaceListings = new Map();
       const pendingBridgeRequests = new Map();
@@ -49,6 +54,7 @@
       window.addEventListener('wm-average-tag-cards', resolveBridgeRequest);
       window.addEventListener('wm-average-starred-cards', resolveBridgeRequest);
       window.addEventListener('wm-average-tag-options', resolveBridgeRequest);
+      window.addEventListener('wm-average-my-listings', resolveBridgeRequest);
 
       function humanElapsed(timestamp) {
         const minutes = Math.max(1, Math.round((Date.now() - timestamp) / 60000));
@@ -58,14 +64,28 @@
         return remaining ? `${hours} h ${remaining} min` : `${hours} h`;
       }
 
-      function requestListing({ button, row, amount, duration, ownedCardId, allowStarred = false }) {
+      // L'état d'une vente suit la carte, pas le bouton : un filtre peut redessiner la ligne
+      // pendant la requête, et le nouveau bouton doit rester bloqué.
+      function paintSale(button, sale) {
+        if (sale) button.dataset.state = sale.state;
+        else delete button.dataset.state;
+        button.disabled = Boolean(sale) && sale.state !== 'error';
+        button.textContent = sale?.text || button.dataset.idleText || 'Mettre en vente';
+        button.title = sale?.title || '';
+        button.closest('.wm-ranking-row')?.classList.toggle('wm-ranking-row-unowned', Boolean(sale?.unowned));
+      }
+
+      function setSale(row, sale) {
+        row.sale = sale;
+        if (row.sellButton?.isConnected) paintSale(row.sellButton, sale);
+      }
+
+      function requestListing({ row, amount, duration, ownedCardId, allowStarred = false }) {
         const requestId = `listing:${row.id}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
 
-        button.disabled = true;
-        button.dataset.state = 'pending';
-        button.textContent = ownedCardId ? 'Mise en vente…' : 'Recherche ID…';
+        setSale(row, { state: 'pending', text: ownedCardId ? 'Mise en vente…' : 'Recherche ID…' });
 
-        pendingMarketplaceListings.set(requestId, { button, row, amount, duration });
+        pendingMarketplaceListings.set(requestId, { row, amount, duration });
 
         window.dispatchEvent(new CustomEvent('wm-average-create-listing', {
           detail: {
@@ -98,9 +118,18 @@
         return merged;
       }
 
-      async function openRankingModal() {
-        const storedCollection = storageGet(ALL_COLLECTION_KEY);
-        const collectionEntry = storedCollection[ALL_COLLECTION_KEY];
+      // Un double clic ne doit pas empiler deux classements : on pourrait vendre deux fois la même carte.
+      let rankingOpening = null;
+
+      function openRankingModal() {
+        if (document.querySelector('.wm-ranking-overlay')) return Promise.resolve();
+        rankingOpening ||= buildRankingModal().finally(() => { rankingOpening = null; });
+        return rankingOpening;
+      }
+
+      async function buildRankingModal() {
+        await collectionReady;
+        const collectionEntry = readCollection();
         const storedCards = Array.isArray(collectionEntry?.cards) ? collectionEntry.cards : [];
 
         // Merge persisted metadata with cards already discovered during this page session.
@@ -179,7 +208,7 @@
         const unpricedRows = candidates
           .filter((card) => (
             !rankedIds.has(card.id) &&
-            (card.starred || (Array.isArray(card.tags) && card.tags.length > 0))
+            (card.starred || (Array.isArray(card.tags) && card.tags.length > 0) || isGifCard(card))
           ))
           .map((card) => ({ ...card, average: Number.NaN, fetchedAt: 0 }))
           .sort((a, b) => a.title.localeCompare(b.title, 'fr'));
@@ -198,6 +227,78 @@
             cachedCards: rows.length
           }
         );
+      }
+
+      // Une valeur par jour, gardée 60 jours, pour comparer avec la semaine précédente.
+      // Seuls les classements complets sont enregistrés : un chargement partiel fausserait l'écart.
+      function collectionValueHistory() {
+        const history = readLocalValue(COLLECTION_VALUE_KEY);
+        return history && typeof history === 'object' ? history : {};
+      }
+
+      function recordCollectionValue(total) {
+        const history = collectionValueHistory();
+        history[new Date(Date.now()).toISOString().slice(0, 10)] = Math.round(total);
+        const days = Object.keys(history).sort().slice(-60);
+        writeLocalValue(COLLECTION_VALUE_KEY, Object.fromEntries(days.map((day) => [day, history[day]])));
+      }
+
+      // Entre 7 et 10 jours avant aujourd'hui : au-delà, l'écart ne serait plus « sur 7 jours ».
+      function collectionValueWeekAgo() {
+        const history = collectionValueHistory();
+        const oldest = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        const newest = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        const day = Object.keys(history).filter((key) => key >= oldest && key <= newest).sort().pop();
+        return day ? Number(history[day]) : null;
+      }
+
+      function createCollectionValue(rows, status) {
+        let total = 0;
+        let priced = 0;
+        const byRarity = new Map();
+
+        for (const row of rows) {
+          if (!Number.isFinite(row.average)) continue;
+          const value = row.average * (Number(row.count) || 1);
+          total += value;
+          priced += 1;
+          byRarity.set(row.rarity, (byRarity.get(row.rarity) || 0) + value);
+        }
+
+        const weekAgo = collectionValueWeekAgo();
+        const allPriced = !status.incomplete && priced === (Number(status.knownCards) || 0);
+        if (allPriced) recordCollectionValue(total);
+
+        const box = document.createElement('div');
+        box.className = 'wm-ranking-value';
+        box.title = 'Prix moyen des ventes × exemplaires possédés, pour les cartes dont le prix est chargé';
+
+        const totalEl = document.createElement('strong');
+        totalEl.textContent = `Valeur estimée : ${formatAverage(Math.round(total))} W`;
+        box.append(totalEl);
+
+        const addPart = (text, className = '') => {
+          const part = document.createElement('span');
+          part.textContent = text;
+          if (className) part.className = className;
+          box.append(part);
+        };
+
+        const rarityParts = RARITIES
+          .filter((rarity) => byRarity.has(rarity))
+          .map((rarity) => `${rarity} ${formatAverage(Math.round(byRarity.get(rarity)))}`);
+        if (rarityParts.length) addPart(rarityParts.join(' · '));
+
+        const unpriced = Math.max(0, (Number(status.knownCards) || 0) - priced);
+        if (unpriced) addPart(`${formatAverage(unpriced)} carte${unpriced > 1 ? 's' : ''} sans prix`);
+
+        if (weekAgo > 0 && allPriced) {
+          const change = (total - weekAgo) / weekAgo * 100;
+          const sign = change > 0 ? '+' : '';
+          addPart(`${sign}${change.toFixed(1).replace('.', ',')} % sur 7 jours`, change >= 0 ? 'is-up' : 'is-down');
+        }
+
+        return box;
       }
 
       function renderRankingModal(rows, collectionFetchedAt, status = {}) {
@@ -253,14 +354,32 @@
         const priceLabel = document.createElement('span');
         priceLabel.textContent = 'Prix de mise en vente';
 
+        // Par défaut, un pourcentage de la moyenne : un prix fixe unique vendait aussi bien
+        // une carte à 3 W qu'une carte à 2 000 W au même montant.
+        const savedSale = readLocalValue(SALE_SETTINGS_KEY) || {};
+
+        const priceInputs = document.createElement('div');
+        priceInputs.className = 'wm-ranking-price-inputs';
+
         const priceInput = document.createElement('input');
         priceInput.type = 'number';
         priceInput.min = '1';
         priceInput.step = '1';
-        priceInput.value = '10';
         priceInput.inputMode = 'decimal';
 
-        priceField.append(priceLabel, priceInput);
+        const unitInput = document.createElement('select');
+        unitInput.setAttribute('aria-label', 'Unité du prix');
+        for (const [value, label] of [['percent', '% de la moyenne'], ['fixed', 'W (prix fixe)']]) {
+          const option = document.createElement('option');
+          option.value = value;
+          option.textContent = label;
+          unitInput.append(option);
+        }
+        unitInput.value = savedSale.unit === 'fixed' ? 'fixed' : 'percent';
+        priceInput.value = Number(savedSale.value) > 0 ? String(savedSale.value) : '100';
+
+        priceInputs.append(priceInput, unitInput);
+        priceField.append(priceLabel, priceInputs);
 
         const durationField = document.createElement('label');
         durationField.className = 'wm-ranking-sale-field';
@@ -276,8 +395,7 @@
           [60, '1 h'],
           [180, '3 h'],
           [360, '6 h'],
-          [720, '12 h'],
-          [1440, '24 h']
+          [720, '12 h']
         ];
 
         for (const [value, label] of durationOptions) {
@@ -287,13 +405,24 @@
           durationInput.append(option);
         }
 
-        durationInput.value = '10';
+        durationInput.value = durationOptions.some(([value]) => value === Number(savedSale.duration))
+          ? String(savedSale.duration)
+          : '10';
 
         durationField.append(durationLabel, durationInput);
 
         const hint = document.createElement('div');
         hint.className = 'wm-ranking-sale-hint';
-        hint.textContent = 'Chaque bouton utilise ces deux valeurs.';
+        hint.textContent = 'Chaque bouton affiche le montant de sa carte. Sans prix moyen, seul un prix fixe permet de la vendre.';
+
+        const amountFor = (row) => {
+          const value = Number(priceInput.value);
+          if (!Number.isFinite(value) || value <= 0) return null;
+          if (unitInput.value === 'fixed') return Math.max(1, Math.round(value));
+          return Number.isFinite(row.average) && row.average > 0
+            ? Math.max(1, Math.round(row.average * value / 100))
+            : null;
+        };
 
         saleControls.append(priceField, durationField, hint);
 
@@ -328,6 +457,10 @@
         // Cartes d'un filtre telles que renvoyées par le site : clé -> { state, rows }.
         const fetchedResults = new Map();
         const STARRED_KEY = '__starred__';
+        const UNTAGGED_KEY = '__untagged__';
+        // Pseudo-étiquette calculée par l'extension : rien n'est écrit sur le compte du joueur.
+        const GIF_KEY = '__gif__';
+        const isLocalFilter = (key) => key === UNTAGGED_KEY || key === GIF_KEY;
 
         const filters = document.createElement('div');
         filters.className = 'wm-ranking-filters';
@@ -351,6 +484,15 @@
         allTagsOption.value = '';
         allTagsOption.textContent = 'Toutes les étiquettes';
 
+        const untaggedOption = document.createElement('option');
+        untaggedOption.value = UNTAGGED_KEY;
+        untaggedOption.textContent = 'Sans étiquette';
+
+        const gifCount = filterableRows.filter(({ row }) => isGifCard(row)).length;
+        const gifOption = document.createElement('option');
+        gifOption.value = GIF_KEY;
+        gifOption.textContent = `GIFs (${gifCount})`;
+
         const fillTagOptions = () => {
           const selected = tagSelect.value;
           const options = [...knownTags.values()]
@@ -364,17 +506,38 @@
               return option;
             });
 
-          tagSelect.replaceChildren(allTagsOption, ...options);
-          tagSelect.value = knownTags.has(selected) ? selected : '';
-          tagSelect.hidden = knownTags.size === 0;
+          tagSelect.replaceChildren(allTagsOption, untaggedOption, gifOption, ...options);
+          tagSelect.value = knownTags.has(selected) || isLocalFilter(selected) ? selected : '';
         };
 
         fillTagOptions();
+        tagSelect.value = UNTAGGED_KEY;
+
+        const raritySelect = document.createElement('select');
+        raritySelect.className = 'wm-ranking-filter-tag';
+        raritySelect.setAttribute('aria-label', 'Filtrer par rareté');
+        for (const value of ['', ...RARITIES]) {
+          const option = document.createElement('option');
+          option.value = value;
+          option.textContent = value || 'Toutes les raretés';
+          raritySelect.append(option);
+        }
+
+        const duplicatesFilter = document.createElement('label');
+        duplicatesFilter.className = 'wm-ranking-filter-starred';
+
+        const duplicatesInput = document.createElement('input');
+        duplicatesInput.type = 'checkbox';
+
+        const duplicatesText = document.createElement('span');
+        duplicatesText.textContent = 'Doublons uniquement';
+
+        duplicatesFilter.append(duplicatesInput, duplicatesText);
 
         const filterCount = document.createElement('span');
         filterCount.className = 'wm-ranking-filter-count';
 
-        filters.append(starredFilter, tagSelect, filterCount);
+        filters.append(starredFilter, duplicatesFilter, tagSelect, raritySelect, filterCount);
 
         const list = document.createElement('div');
         list.className = 'wm-ranking-list';
@@ -382,19 +545,29 @@
         const PAGE_SIZE = 50;
         let renderedCount = 0;
 
-        const saleInputsAreValid = () => {
-          const amount = Number(priceInput.value);
-          const duration = Number(durationInput.value);
-          return Number.isFinite(amount) && amount > 0 && Number.isFinite(duration) && duration > 0;
+        const rowByButton = new WeakMap();
+
+        const refreshSaleButton = (button) => {
+          const row = rowByButton.get(button);
+          if (!row) return;
+          const amount = Number(durationInput.value) > 0 ? amountFor(row) : null;
+          button.dataset.idleText = amount ? `Vendre ${formatAverage(amount)} W` : 'Pas de prix';
+          if (button.dataset.state === 'pending' || button.dataset.state === 'success') return;
+          button.disabled = !amount;
+          if (button.dataset.state !== 'error') button.textContent = button.dataset.idleText;
         };
 
         const refreshSaleButtons = () => {
-          const valid = saleInputsAreValid();
+          for (const button of list.querySelectorAll('.wm-ranking-sell-button')) refreshSaleButton(button);
+        };
 
-          for (const button of list.querySelectorAll('.wm-ranking-sell-button')) {
-            if (button.dataset.state === 'pending' || button.dataset.state === 'success') continue;
-            button.disabled = !valid;
-          }
+        const onSaleSettingsChange = () => {
+          writeLocalValue(SALE_SETTINGS_KEY, {
+            value: Number(priceInput.value) || null,
+            unit: unitInput.value,
+            duration: Number(durationInput.value)
+          });
+          refreshSaleButtons();
         };
 
         const createRankingRow = (row, index) => {
@@ -472,15 +645,21 @@
           const sellButton = document.createElement('button');
           sellButton.type = 'button';
           sellButton.className = 'wm-tool-button wm-ranking-sell-button';
-          sellButton.textContent = 'Mettre en vente';
           sellButton.dataset.cardId = row.id;
-          sellButton.disabled = !saleInputsAreValid();
+          rowByButton.set(sellButton, row);
+          refreshSaleButton(sellButton);
+          row.sellButton = sellButton;
+          if (row.sale) {
+            paintSale(sellButton, row.sale);
+            if (row.sale.unowned) item.classList.add('wm-ranking-row-unowned');
+          }
 
           sellButton.addEventListener('click', () => {
-            const amount = Number(priceInput.value);
+            if (row.sale && row.sale.state !== 'error') return;
+            const amount = amountFor(row);
             const duration = Number(durationInput.value);
 
-            if (!Number.isFinite(amount) || amount <= 0) {
+            if (!amount) {
               priceInput.focus();
               return;
             }
@@ -496,7 +675,7 @@
               ? null
               : (row.ownedCardId || row.ownedCardIds?.[0] || null);
 
-            requestListing({ button: sellButton, row, amount, duration, ownedCardId });
+            requestListing({ row, amount, duration, ownedCardId });
           });
 
           item.append(rank, thumb, info, price);
@@ -578,7 +757,8 @@
           if (fetchedResults.has(key)) return;
           fetchedResults.set(key, { state: 'loading' });
 
-          requestBridge(eventName, detail).then((response) => {
+          // Ces chargements paginés (250 ms entre pages) dépassent largement 12 s.
+          requestBridge(eventName, detail, 180000).then((response) => {
             if (closed) return;
 
             fetchedResults.set(key, response.ok
@@ -589,7 +769,8 @@
               : { state: 'error' });
 
             // Ne redessine que si ce filtre est toujours celui affiché.
-            const currentKey = tagSelect.value || (starredInput.checked ? STARRED_KEY : '');
+            const tagged = !isLocalFilter(tagSelect.value) && tagSelect.value;
+            const currentKey = tagged || (starredInput.checked ? STARRED_KEY : '');
             if (currentKey === key) applyFilters();
           });
         };
@@ -597,8 +778,12 @@
         const applyFilters = () => {
           const starredOnly = starredInput.checked;
           const key = tagSelect.value;
-          const tag = key ? knownTags.get(key) : null;
-          const filterActive = starredOnly || Boolean(tag);
+          const untaggedOnly = key === UNTAGGED_KEY;
+          const gifOnly = key === GIF_KEY;
+          const tag = key && !isLocalFilter(key) ? knownTags.get(key) : null;
+          const rarity = raritySelect.value;
+          const duplicatesOnly = duplicatesInput.checked;
+          const filterActive = starredOnly || untaggedOnly || gifOnly || Boolean(tag) || Boolean(rarity) || duplicatesOnly;
 
           let pool = filterActive ? filterableRows : rankedRows;
           let result = null;
@@ -630,7 +815,13 @@
           if (result?.state === 'loading') note = ' • chargement…';
           if (result?.state === 'error') note = ' • liste peut-être incomplète';
 
-          visibleRows = pool.filter(({ row }) => !starredOnly || row.starred);
+          visibleRows = pool.filter(({ row }) => (
+            (!starredOnly || row.starred) &&
+            (!untaggedOnly || rowTags(row).length === 0) &&
+            (!gifOnly || isGifCard(row)) &&
+            (!rarity || row.rarity === rarity) &&
+            (!duplicatesOnly || (Number(row.count) || 1) > 1)
+          ));
 
           const unpricedCount = visibleRows
             .filter(({ row }) => !Number.isFinite(row.average)).length;
@@ -659,6 +850,8 @@
 
         starredInput.addEventListener('change', applyFilters);
         tagSelect.addEventListener('change', applyFilters);
+        raritySelect.addEventListener('change', applyFilters);
+        duplicatesInput.addEventListener('change', applyFilters);
 
         const observer = new IntersectionObserver((entries) => {
           if (entries.some((entry) => entry.isIntersecting)) {
@@ -670,10 +863,11 @@
           threshold: 0
         });
 
-        priceInput.addEventListener('input', refreshSaleButtons);
-        durationInput.addEventListener('change', refreshSaleButtons);
+        priceInput.addEventListener('input', onSaleSettingsChange);
+        unitInput.addEventListener('change', onSaleSettingsChange);
+        durationInput.addEventListener('change', onSaleSettingsChange);
 
-        renderNextChunk();
+        applyFilters();
         observer.observe(sentinel);
 
         const close = () => {
@@ -687,7 +881,7 @@
           if (event.target === overlay) close();
         });
 
-        modal.append(header);
+        modal.append(header, createCollectionValue(rows, status));
         if (cacheNotice) modal.append(cacheNotice);
         if (salesEnabled) modal.append(saleControls);
         modal.append(filters, list);
@@ -700,18 +894,37 @@
           addKnownTags(detail.tags);
           fillTagOptions();
         });
+
+        // Marque les cartes déjà en vente au lieu de l'apprendre seulement après un clic qui échoue.
+        if (salesEnabled) {
+          requestBridge('wm-average-load-my-listings').then((mine) => {
+            if (closed || !mine.ok || !mine.text) return;
+
+            for (const { row } of filterableRows) {
+              if (row.sale) continue;
+              const ownedCardIds = Array.isArray(row.ownedCardIds) ? row.ownedCardIds : [];
+              if (ownedCardIds.length && ownedCardIds.every((id) => mine.text.includes(id))) {
+                setSale(row, {
+                  state: 'success',
+                  text: 'Déjà en vente',
+                  title: 'Toutes tes copies disponibles sont déjà en vente.'
+                });
+              }
+            }
+          });
+        }
       }
 
 
       window.addEventListener('wm-average-create-listing-progress', (event) => {
         const detail = event.detail || {};
         const pending = pendingMarketplaceListings.get(detail.requestId);
-        if (!pending?.button?.isConnected) return;
+        if (!pending) return;
 
         if (detail.state === 'refreshing-id') {
-          pending.button.textContent = 'ID expiré • recherche…';
+          setSale(pending.row, { state: 'pending', text: 'ID expiré • recherche…' });
         } else if (detail.state === 'resolving-id') {
-          pending.button.textContent = 'Recherche ID…';
+          setSale(pending.row, { state: 'pending', text: 'Recherche ID…' });
         }
       });
 
@@ -722,28 +935,28 @@
 
         pendingMarketplaceListings.delete(detail.requestId);
 
-        const { button, row, amount, duration } = pending;
-        if (!button?.isConnected) return;
+        const { row, amount, duration } = pending;
 
         if (detail.needsStarredConfirmation) {
-          button.textContent = 'Confirmation…';
+          // Classement fermé entre-temps : pas de question surprise, la vente est abandonnée.
+          if (!row.sellButton?.isConnected) {
+            setSale(row, null);
+            return;
+          }
+
+          setSale(row, { state: 'pending', text: 'Confirmation…' });
 
           runtime.modalUi.showConfirmModal(
             'Vendre ton exemplaire favori ?',
             `« ${row.title} » : le seul exemplaire disponible est en favori. Le mettre en vente quand même ?`,
             { confirmLabel: 'Vendre le favori', cancelLabel: 'Garder la carte' }
           ).then((confirmed) => {
-            if (!button.isConnected) return;
-
-            if (!confirmed) {
-              delete button.dataset.state;
-              button.disabled = false;
-              button.textContent = 'Mettre en vente';
+            if (!confirmed || !row.sellButton?.isConnected) {
+              setSale(row, null);
               return;
             }
 
             requestListing({
-              button,
               row,
               amount,
               duration,
@@ -784,10 +997,11 @@
             }
           }
 
-          button.dataset.state = 'success';
-          button.disabled = true;
-          button.textContent = 'En vente ✓';
-          button.title = `${formatAverage(amount)} W pendant ${formatAverage(duration)} min`;
+          setSale(row, {
+            state: 'success',
+            text: 'En vente ✓',
+            title: `${formatAverage(amount)} W pendant ${formatAverage(duration)} min`
+          });
           return;
         }
 
@@ -802,21 +1016,21 @@
           row.ownedCardId = null;
           row.ownedCardIds = [];
 
-          const rankingRow = button.closest('.wm-ranking-row');
-          rankingRow?.classList.add('wm-ranking-row-unowned');
-
-          button.dataset.state = 'success';
-          button.disabled = true;
-          button.textContent = 'Plus possédée';
-          button.title = 'Cette carte n’est plus dans ta collection.';
+          setSale(row, {
+            state: 'success',
+            text: 'Plus possédée',
+            title: 'Cette carte n’est plus dans ta collection.',
+            unowned: true
+          });
           return;
         }
 
         if (detail.alreadyListed) {
-          button.dataset.state = 'success';
-          button.disabled = true;
-          button.textContent = 'Déjà en vente';
-          button.title = detail.error || 'Toutes tes copies disponibles sont déjà en vente.';
+          setSale(row, {
+            state: 'success',
+            text: 'Déjà en vente',
+            title: detail.error || 'Toutes tes copies disponibles sont déjà en vente.'
+          });
           return;
         }
 
@@ -843,12 +1057,11 @@
           }
         }
 
-        button.dataset.state = 'error';
-        button.disabled = false;
-        button.textContent = detail.ownershipError
-          ? 'ID invalide — réessayer'
-          : 'Erreur — réessayer';
-        button.title = detail.error || 'Impossible de mettre cette carte en vente.';
+        setSale(row, {
+          state: 'error',
+          text: detail.ownershipError ? 'ID invalide — réessayer' : 'Erreur — réessayer',
+          title: detail.error || 'Impossible de mettre cette carte en vente.'
+        });
       });
 
 

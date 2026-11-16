@@ -829,6 +829,24 @@ html.wm-theme-route main > :not(#wm-theme-tracker-page) {
   font-size: 11px;
 }
 
+.wm-family-picker-word {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  color: var(--wm-family-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.wm-family-picker-search .wm-family-picker-word input {
+  width: auto;
+  height: auto;
+  flex: none;
+  padding: 0;
+  accent-color: rgb(168, 85, 247);
+}
+
 .wm-family-picker-status {
   min-height: 27px;
   padding: 0 18px 9px;

@@ -3,7 +3,7 @@
 
   registry.trades = {
     create(deps) {
-      const { isTradesPage, normalizeTitle, cardMetaById, idByTitle, cacheMemory, renderCollectionCard, reportError, loadCacheForCards, createSponsorNote, formatAverage, chooseAverage, registerCards, isFeatureEnabled } = deps;
+      const { isTradesPage, normalizeTitle, cardMetaById, idByTitle, cacheMemory, renderCollectionCard, reportError, loadCacheForCards, formatAverage, chooseAverage, registerCards, isFeatureEnabled, currentUserId } = deps;
       const tradesById = new Map();
       const activeTradeValueIds = new Set();
       let tradesRequested = false;
@@ -70,7 +70,7 @@
         if (!cardsToLoad.size) return;
     
         try {
-          loadCacheForCards([...cardsToLoad.values()]);
+          loadCacheForCards([...cardsToLoad.values()], { priority: true });
         } catch (error) {
           reportError('prix cartes détail échange', error);
         }
@@ -177,13 +177,13 @@
             ).values()];
     
             try {
-              loadCacheForCards(cards);
+              loadCacheForCards(cards, { priority: true });
             } catch (error) {
               reportError('prix échange', error);
             }
           });
     
-          controls.append(button, createSponsorNote());
+          controls.append(button);
           cardEl.append(controls);
         }
     
@@ -320,8 +320,36 @@
         } else {
           section.append(heading, list, totalRow);
         }
-    
-        return section;
+
+        return { section, total, pending, missing, userId, username: user?.username || null };
+      }
+
+      // Ce que tu reçois moins ce que tu donnes. Sans ton identifiant, l'écart est donné
+      // du point de vue de l'initiateur.
+      function createTradeBalance(initiator, recipient) {
+        if (initiator.pending || recipient.pending) return null;
+
+        const myId = currentUserId?.();
+        const mine = myId && myId === recipient.userId ? recipient : initiator;
+        const other = mine === initiator ? recipient : initiator;
+        const diff = other.total - mine.total;
+        const percent = mine.total > 0 ? diff / mine.total * 100 : null;
+        const sign = diff > 0 ? '+' : diff < 0 ? '−' : '';
+
+        const balance = document.createElement('div');
+        balance.className = `wm-trade-balance ${diff >= 0 ? 'is-up' : 'is-down'}`;
+
+        const who = myId && (myId === initiator.userId || myId === recipient.userId)
+          ? 'pour toi'
+          : `pour ${mine.username || 'l’initiateur'}`;
+        const percentText = percent == null ? '' : ` (${sign}${formatAverage(Math.abs(Math.round(percent)))} %)`;
+        balance.textContent = `Écart : ${sign}${formatAverage(Math.abs(Math.round(diff)))} W ${who}${percentText}`;
+
+        if (initiator.missing || recipient.missing) {
+          balance.append(document.createTextNode(' · estimation partielle'));
+        }
+
+        return balance;
       }
     
       function renderTradeValues(tradeId) {
@@ -338,10 +366,10 @@
           cardEl.append(panel);
         }
     
-        panel.replaceChildren(
-          createTradeSide(trade, 'initiator'),
-          createTradeSide(trade, 'recipient')
-        );
+        const initiator = createTradeSide(trade, 'initiator');
+        const recipient = createTradeSide(trade, 'recipient');
+        const balance = createTradeBalance(initiator, recipient);
+        panel.replaceChildren(initiator.section, recipient.section, ...(balance ? [balance] : []));
       }
     
 
@@ -455,24 +483,6 @@
           ensureTradeButton(cardEl, trade);
         }
       }
-    
-      // Rappel de consentement mémorisé : si l'utilisateur a déjà confirmé la case lors
-      // d'une session précédente, on restaure son choix automatiquement pour éviter de
-      // lui redemander la même chose à chaque visite (préférence persistante).
-      const acknowledgedChecks = new WeakSet();
-    
-      // Profil de réactivité de la session : chaque utilisateur garde un rythme
-      // constant pendant toute sa visite ; on le calibre une seule fois au chargement.
-      const uiResponseProfile = {
-        // Rythme de lecture global : 1.0 = rapide, jusqu'à ~2.4 = lent.
-        responsePace: 1 + Math.random() * 1.4,
-        // Délai de délibération général entre deux interactions.
-        deliberation: 0.55 + Math.random() * 1.15,
-        // Temps de stabilisation de l'interface avant la première interaction :
-        // le bloc vient d'apparaître, on attend que la mise en page soit complète.
-        settleDelay: 300 + Math.random() * 1500
-      };
-    
     
       function renderTradeValuesForCard(id) {
         if (!isFeatureEnabled('tradeValues')) return;

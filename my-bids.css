@@ -176,6 +176,18 @@ html.wm-bids-route main > :not(#wm-my-bids-page) {
   cursor: not-allowed;
 }
 
+.wm-bids-bid.is-above-average {
+  background: #f59e0b;
+  color: #1c1203;
+}
+
+.wm-bids-average {
+  display: block;
+  color: #94a3b8;
+  font-size: 0.72rem;
+  font-weight: 500;
+}
+
 .wm-bids-row-error {
   grid-column: 1 / -1;
   font-size: 0.78rem;

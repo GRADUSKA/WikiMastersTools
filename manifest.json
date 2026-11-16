@@ -1,20 +1,18 @@
 {
   "manifest_version": 3,
   "name": "WikiMasters - Prix moyen collection",
-  "version": "4.29.1",
+  "version": "4.37.0",
   "description": "Outils WikiMasters configurables : familles de cartes, prix moyens, collection, échanges, paquets, cartes full-art et Wikipédia.",
   "permissions": [
     "clipboardWrite"
   ],
   "host_permissions": [
-    "https://www.wiki-masters.com/*",
-    "https://www.wikidata.org/*",
-    "https://query.wikidata.org/*",
-    "https://fr.wikipedia.org/*"
+    "https://www.wiki-masters.com/*"
   ],
   "browser_specific_settings": {
     "gecko": {
       "id": "wikimasters-tools@kzfamily",
+      "strict_min_version": "140.0",
       "data_collection_permissions": {
         "required": [
           "none"
@@ -61,6 +59,7 @@
         "features/packs.js",
         "features/ranking.js",
         "features/collection-bulk.js",
+        "features/gif-view.js",
         "features/extra-tools.js",
         "features/theme-tracker.js",
         "features/my-bids-logic.js",

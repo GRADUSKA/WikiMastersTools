@@ -6,7 +6,7 @@
       const {
         CACHE_TTL, BULK_RARITY_LAST_LOAD_KEY, ALL_COLLECTION_KEY, RARITIES,
         DEFAULT_RARE_RARITIES, isCollectionPage, normalizeTitle, cacheKey,
-        storageGet, storageSet, reportError, createSponsorNote, isContextInvalidatedError
+        storageGet, storageSet, collectionReady, readCollection, toStoredCard, reportError, isContextInvalidatedError
       } = runtime.core;
 
       let bulkActive = false;
@@ -14,6 +14,8 @@
       let bulkSelectedRarities = new Set(DEFAULT_RARE_RARITIES);
       let bulkForceRarities = new Set();
       let bulkOnlyUnloaded = false;
+      let bulkPartial = false;
+      const COLLECTION_REUSE_MS = 12 * 60 * 60 * 1000;
       let bulkButton = null;
       let rankingButton = null;
 
@@ -102,9 +104,9 @@
           bulkButton.type = 'button';
           bulkButton.className = 'wm-tool-button';
           bulkButton.textContent = 'Charger les prix';
-          bulkButton.title = 'Choisir les raretés dont tu veux charger ou actualiser les prix';
-          bulkButton.addEventListener('click', () => {
-            handleBulkClick().catch((error) => reportError('chargement', error));
+          bulkButton.title = 'Choisir les raretés dont tu veux charger ou actualiser les prix (Maj + clic : relire toute la collection)';
+          bulkButton.addEventListener('click', (event) => {
+            handleBulkClick(event.shiftKey).catch((error) => reportError('chargement', error));
           });
           bar.append(bulkButton);
         }
@@ -127,12 +129,11 @@
           bar.append(rankingButton);
         }
 
-        bar.append(createSponsorNote());
         header.insertAdjacentElement('afterend', bar);
         ensurePriceLegend(bar);
       }
 
-      async function handleBulkClick() {
+      async function handleBulkClick(forceFullReload = false) {
         if (bulkActive) return;
 
         const lastLoadsData = storageGet(BULK_RARITY_LAST_LOAD_KEY);
@@ -159,11 +160,29 @@
           }
         }
 
+        // Un autre clic a pu lancer le chargement pendant les confirmations.
+        if (bulkActive) return;
+
         bulkActive = true;
+        bulkPartial = false;
         bulkSelectedRarities = new Set(selected);
         bulkForceRarities = forceRarities;
         bulkOnlyUnloaded = onlyUnloaded;
         bulkRequestId = `bulk:${now}:${Math.random().toString(36).slice(2)}`;
+
+        // La collection complète est déjà stockée : inutile de relire ~120 pages pour chaque relance.
+        await collectionReady;
+        const stored = readCollection();
+        if (
+          !forceFullReload &&
+          stored?.complete === true &&
+          Array.isArray(stored.cards) && stored.cards.length &&
+          Date.now() - Number(stored.fetchedAt) < COLLECTION_REUSE_MS
+        ) {
+          setBulkButtonState('Collection (cache)…', true);
+          handleCollectionResult({ ok: true, cards: stored.cards, complete: true, fromCache: true });
+          return;
+        }
 
         setBulkButtonState('Collection…', true);
 
@@ -344,17 +363,26 @@
         bulkButton.disabled = Boolean(disabled);
       }
 
-      function updateBulkProgress(total, pendingCount) {
+      function formatEta(ms) {
+        const minutes = Math.ceil(ms / 60000);
+        if (minutes < 90) return `~${Math.max(1, minutes)} min`;
+        return `~${Math.round(minutes / 6) / 10} h`;
+      }
+
+      function updateBulkProgress(total, pendingCount, paused = false, etaMs = 0) {
         if (!bulkActive || !total) return;
         const completed = Math.max(0, total - pendingCount);
         const label = bulkOnlyUnloaded ? 'Nouvelles' : 'Prix';
-        setBulkButtonState(`${label} ${completed}/${total}`, true);
+        // Le site limite les requêtes : l'extension attend avant de reprendre.
+        const suffix = `${paused ? ' · pause' : ''}${etaMs > 0 ? ` · ${formatEta(etaMs)}` : ''}`;
+        setBulkButtonState(`${label} ${completed}/${total}${suffix}`, true);
       }
 
       function finishBulkLoad(doneLabel = 'Chargé ✓') {
         if (!bulkActive) return;
 
-        if (!bulkOnlyUnloaded) {
+        // Une collection tronquée ne prouve pas que ces raretés sont à jour.
+        if (!bulkOnlyUnloaded && !bulkPartial) {
           const selectedRarities = [...bulkSelectedRarities];
           const data = storageGet(BULK_RARITY_LAST_LOAD_KEY);
           const lastLoads = { ...(data[BULK_RARITY_LAST_LOAD_KEY] || {}) };
@@ -452,10 +480,7 @@
         }
       });
 
-      window.addEventListener('wm-average-all-collection', (event) => {
-        const detail = event.detail || {};
-        if (!bulkActive || detail.requestId !== bulkRequestId) return;
-
+      function handleCollectionResult(detail) {
         if (!detail.ok) {
           failBulkLoad(detail.error || 'Erreur réseau');
           return;
@@ -464,14 +489,24 @@
         const cards = Array.isArray(detail.cards) ? detail.cards : [];
         const fetchedAt = Date.now();
 
-        if (detail.complete) {
+        if (detail.partialError) {
+          bulkPartial = true;
+          runtime.modalUi.showInfoModal(
+            'Chargement partiel',
+            `${detail.partialError}. Les ${cards.length} cartes déjà lues sont chargées ; relance plus tard pour le reste.`
+          );
+        }
+
+        if (detail.fromCache) {
+          // Déjà stockée telle quelle : inutile de la réécrire.
+        } else if (detail.complete) {
           storageSet({
-            [ALL_COLLECTION_KEY]: { fetchedAt, cards, complete: true }
+            [ALL_COLLECTION_KEY]: { fetchedAt, cards: cards.map(toStoredCard), complete: true }
           });
         } else {
           // Keep every piece of collection metadata we have already seen.
           // A partial load is enough for « Plus chères » to rank the cached prices.
-          const existingEntry = storageGet(ALL_COLLECTION_KEY)[ALL_COLLECTION_KEY];
+          const existingEntry = readCollection();
           const existingCards = Array.isArray(existingEntry?.cards) ? existingEntry.cards : [];
           const merged = new Map(existingCards.map((card) => [card.id, { ...card }]));
 
@@ -483,7 +518,7 @@
           storageSet({
             [ALL_COLLECTION_KEY]: {
               fetchedAt,
-              cards: [...merged.values()],
+              cards: [...merged.values()].map(toStoredCard),
               complete: existingEntry?.complete === true
             }
           });
@@ -495,11 +530,20 @@
         }
 
         let selectedCards = cards.filter((card) => bulkSelectedRarities.has(card.rarity));
+        const cached = storageGet(selectedCards.map((card) => cacheKey(card.id)));
 
         if (bulkOnlyUnloaded && selectedCards.length) {
-          const cached = storageGet(selectedCards.map((card) => cacheKey(card.id)));
-          selectedCards = selectedCards.filter((card) => cached[cacheKey(card.id)] === undefined);
+          // Un prix en échec (403, délai...) reste en cache : il doit être retenté.
+          selectedCards = selectedCards.filter((card) => !cached[cacheKey(card.id)]?.ok);
         }
+
+        // Les cartes chères d'abord, d'après leur dernier prix même expiré : elles sont à jour au bout
+        // de quelques minutes au lieu de quelques heures. Une carte jamais chargée passe en tête aussi.
+        const lastAverage = new Map(selectedCards.map((card) => [
+          card.id,
+          runtime.priceUi.chooseAverage(cached[cacheKey(card.id)], null, card.rarity || null) ?? Infinity
+        ]));
+        selectedCards = [...selectedCards].sort((a, b) => (lastAverage.get(b.id) - lastAverage.get(a.id)) || 0);
 
         if (!selectedCards.length) {
           finishBulkLoad(bulkOnlyUnloaded ? 'Aucune nouvelle ✓' : 'Chargé ✓');
@@ -523,6 +567,12 @@
             failBulkLoad(String(error?.message || error));
           }
         }
+      }
+
+      window.addEventListener('wm-average-all-collection', (event) => {
+        const detail = event.detail || {};
+        if (!bulkActive || detail.requestId !== bulkRequestId) return;
+        handleCollectionResult(detail);
       });
 
 

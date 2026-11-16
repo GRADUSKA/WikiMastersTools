@@ -12,7 +12,7 @@ function harness(files, extras = {}) {
   const window = new EventTarget();
   const context = vm.createContext({
     window, console: { debug() {}, warn() {}, error() {} }, CustomEvent,
-    AbortController, Response, URL, Headers, navigator: {}, CSS: { escape: v => v },
+    AbortController, Response, URL, Headers, structuredClone, navigator: {}, CSS: { escape: v => v },
     location: { origin: 'https://www.wiki-masters.com', pathname: '/collection' },
     document: {}, localStorage: { getItem() { return null; }, setItem() {} },
     Date: class extends Date { static now() { return now; } },
@@ -94,7 +94,7 @@ test('la réponse met à jour tous les exemplaires et respecte leur rareté affi
   const cards = ['C','UR','UR'].map(rarity => {
     const badge = {className:'wm-average-badge', classList:{contains:() => false}, parentElement:{}, textContent:'Prix…'};
     badges.push(badge);
-    return {querySelector:selector => selector === '.wm-average-badge' ? badge : null,
+    return {dataset:{wmCardId:'a'}, querySelector:selector => selector === '.wm-average-badge' ? badge : null,
       querySelectorAll:() => [{textContent:rarity}]};
   });
   const {core, runtime} = priceHarness({document:{querySelectorAll:() => cards}});
@@ -104,8 +104,43 @@ test('la réponse met à jour tous les exemplaires et respecte leur rareté affi
   assert.deepEqual(badges.map(b => b.textContent), ['Moy. 2 W','Moy. 200 W','Moy. 200 W']);
 });
 
-function loaderHarness() {
-  const h = priceHarness();
+test('des milliers de prix rendus dans la même tâche ne parcourent la page qu’une fois', async () => {
+  let scans = 0;
+  const badge = {classList:{contains:() => true}, parentElement:{}, textContent:'Prix…'};
+  const cards = ['a','b'].map(id => ({dataset:{wmCardId:id}, querySelector:selector => selector === '.wm-average-badge' ? badge : null, querySelectorAll:() => []}));
+  const document = {querySelectorAll:selector => { if (selector === '[data-wm-card-id]') scans++; return selector === '[data-wm-card-id]' ? cards : []; }};
+  const {runtime} = priceHarness({document});
+  for (let n = 0; n < 1000; n++) runtime.priceUi.renderKnownCard(n % 2 ? 'a' : 'b');
+  assert.equal(scans,1);
+  await flush();
+  runtime.priceUi.renderKnownCard('a');
+  assert.equal(scans,2);
+});
+
+test('un paquet tiré est valorisé dès que tous ses prix sont connus', () => {
+  const h = harness(['features/pull-stats.js']);
+  const prices = new Map([['a',{ok:true,averages:{C:2}}]]);
+  const store = new Map();
+  const stats = h.window.__wmAverageFeatures.pullStats.create({
+    RARITIES:['L','UR','SR','R','PC','C'], PULL_STATS_KEY:'s',
+    readLocalValue: key => store.get(key), writeLocalValue: (key, value) => store.set(key, structuredClone(value)),
+    isPullsPage: () => false, isFeatureEnabled: () => true,
+    priceEntry: id => prices.get(id), chooseAverage: (entry, _el, rarity) => entry.averages[rarity] ?? null, formatAverage: String
+  });
+
+  stats.recordPullStats([{id:'a',rarity:'C'},{id:'b',rarity:'UR'}]);
+  assert.equal(store.get('s').value.packs,0);
+  assert.equal(store.get('s').pending.length,1);
+
+  prices.set('b',{ok:true,averages:{UR:100}});
+  stats.recordPullStats([{id:'a',rarity:'C'}]);
+  assert.deepEqual(store.get('s').value,{packs:2,total:104,best:102});
+  assert.equal(store.get('s').pending.length,0);
+  assert.equal(store.get('s').counts.C,2);
+});
+
+function loaderHarness(extras) {
+  const h = priceHarness(extras);
   const requests = [], rendered = [];
   h.runtime.priceUi = {renderKnownCard:id => rendered.push(id)};
   const progress = [];
@@ -141,7 +176,7 @@ test('les réponses inconnues et dupliquées ne libèrent aucun emplacement', ()
 test('une requête sans réponse expire et la file reprend', async () => {
   const h = loaderHarness();
   h.loader.loadCacheForCards(['a','b','c','d'].map(id => ({...card,id})));
-  await h.advance(45000);
+  await h.advance(80000);
   assert.equal(h.requests.length, 4);
   assert.equal(h.core.cacheMemory.get('a').ok, false);
   const fourth = h.requests[3];
@@ -268,7 +303,64 @@ test('le verrou empêche les lots concurrents entre onglets', async () => {
   await second.packs.openAllPacks('b');
   assert.equal(calls,1);
   assert.match(second.results[0].error,/autre onglet/);
+  assert.equal(second.results[0].lockBusy,true);
   first.packs.cancelOpenAllPacks('a'); await run;
+  assert.equal(first.results[0].lockBusy,false);
+});
+
+test('un blocage 403 sans JSON attend puis reprend au lieu d’annoncer un paquet perdu', async () => {
+  let calls = 0;
+  const h = packHarness(async () => ++calls === 1 ? new Response('<html>Forbidden</html>', {status:403}) : response({cards:[card],packs_remaining:0}));
+  const run = h.packs.openAllPacks('x'); await flush();
+  assert.equal(calls,1); await h.advance(60199); assert.equal(calls,1);
+  await h.advance(1); await run;
+  assert.equal(calls,2);
+  assert.equal(h.results[0].ok,true);
+  assert.equal(h.progress[0].waiting,true);
+});
+
+test('deux mises en vente simultanées de la même carte n’envoient qu’une annonce', async () => {
+  const h = harness(['bridge/marketplace.js']);
+  let posts = 0, release;
+  h.window.__wmBridgeFeatures.bridgeMarketplace.create({core:{
+    originalFetch: async () => { posts++; await new Promise(resolve => { release = resolve; }); return response({id:'l1'}); },
+    fetchJsonRetry: async () => ({}), extractCards: () => [], sleep: async () => {},
+    emitMarketplaceDetail() {}, MAX_COLLECTION_PAGES: 1, MARKETPLACE_MINE_CACHE_TTL: 60000
+  }});
+  const results = [];
+  h.window.addEventListener('wm-average-create-listing-result', e => results.push(e.detail));
+  const sell = requestId => h.send('wm-average-create-listing', {requestId, ownedCardId:'o1', catalogueCardId:'a', title:'A', baseAmount:10, durationMinutes:10});
+
+  sell('r1'); await flush(); sell('r2'); await flush();
+  assert.equal(posts,1);
+  assert.equal(results.length,1);
+  assert.equal(results[0].requestId,'r2');
+  assert.match(results[0].error,/déjà en cours/);
+
+  release(); await flush();
+  assert.equal(results[1].requestId,'r1');
+  assert.equal(results[1].ok,true);
+
+  sell('r3'); await flush();
+  assert.doesNotMatch(results[2].error || '',/déjà en cours/);
+});
+
+test('« Plus chères » peut demander à l’avance les ventes en cours', async () => {
+  const h = harness(['bridge/marketplace.js']);
+  h.window.__wmBridgeFeatures.bridgeMarketplace.create({core:{
+    originalFetch: async () => response({}),
+    fetchJsonRetry: async () => ({listings:[{owned_card_id:'o1'}]}),
+    extractCards: () => [], sleep: async () => {}, emitMarketplaceDetail() {},
+    MAX_COLLECTION_PAGES: 1, MARKETPLACE_MINE_CACHE_TTL: 60000
+  }});
+  const responses = [];
+  h.window.addEventListener('wm-average-my-listings', e => responses.push(e.detail));
+  h.send('wm-average-load-my-listings', {requestId:'r1'});
+  await flush();
+
+  assert.equal(responses[0].ok,true);
+  assert.match(responses[0].text,/o1/);
+  assert.doesNotMatch(responses[0].text,/o2/);
 });
 
 test('un événement dupliqué ne lance pas un nouveau lot', async () => {
@@ -337,9 +429,10 @@ test('HTTP 429 respecte Retry-After sans relancer immédiatement', async () => {
 test('une limitation des prix suspend aussi les prochaines cartes de la file', async () => {
   const h = loaderHarness();
   h.loader.loadCacheForCards(['a','b','c','d'].map(id => ({...card,id})));
-  h.send('wm-average-response',{...h.requests[0],ok:false,rateLimited:true,retryAfterMs:120000});
+  h.send('wm-average-response',{...h.requests[0],ok:false,rateLimited:true,retryAfterMs:120000,retryAfterHintMs:120000});
   assert.equal(h.requests.length,3);
   await h.advance(119999); assert.equal(h.requests.length,3);
+  // Reprise : une seule requête de sonde tant qu'aucune ne passe.
   await h.advance(1); assert.equal(h.requests.length,4);
 });
 
@@ -355,6 +448,31 @@ test('la collection abandonne après trois erreurs réseau et rend le contrôle 
   await flush(); await h.advance(1000); await run;
   assert.equal(calls,3);
   assert.equal(results[0].ok,false);
+});
+
+test('une requête sans réponse est abandonnée avec un message clair, puis retentée plus tard', async () => {
+  const h = harness(['bridge/core.js']);
+  let calls = 0;
+  h.window.fetch = (_url,{signal}) => ++calls === 1
+    ? new Promise((_resolve,reject) => signal.addEventListener('abort',() => reject(Object.assign(new Error('signal is aborted without reason'),{name:'AbortError'}))))
+    : Promise.resolve(response({ok:true}));
+  const core = h.window.__wmBridgeFeatures.bridgeCore.create();
+  const run = core.fetchJsonRetry('/api/my-collection',{}, {label:'Collection page 3',timeoutMs:15000});
+  await flush(); await h.advance(15000);
+  assert.equal(calls,1);
+  await h.advance(2999); assert.equal(calls,1);
+  await h.advance(1);
+  assert.deepEqual(await run,{ok:true});
+  assert.equal(calls,2);
+});
+
+test('trois requêtes sans réponse donnent « pas de réponse en 15 s », pas le message technique', async () => {
+  const h = harness(['bridge/core.js']);
+  h.window.fetch = (_url,{signal}) => new Promise((_resolve,reject) => signal.addEventListener('abort',() => reject(Object.assign(new Error('signal is aborted without reason'),{name:'AbortError'}))));
+  const core = h.window.__wmBridgeFeatures.bridgeCore.create();
+  const run = core.fetchJsonRetry('/api/my-collection',{}, {label:'Collection page 3'});
+  const rejected = assert.rejects(run,/Collection page 3: pas de réponse en 15 s/);
+  await flush(); await h.advance(120000); await rejected;
 });
 
 test('le chargement collection expire aussi si fetch ne répond pas', async () => {
@@ -454,7 +572,7 @@ test('la progression du lot garde le total pendant les attentes et ne double ni 
   h.send('wm-average-open-all-packs-progress',detail);
   h.send('wm-average-open-all-packs-progress',detail);
   assert.equal(h.recorded.length,1);
-  const stored=JSON.parse(h.localStorage.getItem(h.runtime.core.ALL_COLLECTION_KEY));
+  const stored=h.runtime.core.storageGet(h.runtime.core.ALL_COLLECTION_KEY)[h.runtime.core.ALL_COLLECTION_KEY];
   assert.equal(stored.cards[0].count,5);
   assert.equal(stored.fetchedAt,123);
   const counter=h.document.querySelectorAll('.wm-open-all-progress')[0];
@@ -544,4 +662,523 @@ test('la barre des paquets masque le compteur au repos et n’offre ni arrêt ni
   assert.equal(h.button('Arrêter'),undefined);
   assert.equal(h.button('Revoir le dernier récap'),undefined);
   assert.equal(h.document.querySelectorAll('.wm-open-all-progress')[0].hidden,true);
+});
+
+// Chargement de collection : le fetch simulé répond par URL, aucune requête réelle.
+function collectionHarness(handler) {
+  const h = harness(['bridge/core.js','bridge/collection.js']);
+  const pages = [];
+  h.window.fetch = async (url) => {
+    const { pathname, searchParams } = new URL(url, 'https://www.wiki-masters.com');
+    if (pathname.endsWith('/stats')) return handler({ stats: true });
+    const page = Number(searchParams.get('page'));
+    pages.push(page);
+    return handler({ page });
+  };
+  const core = h.window.__wmBridgeFeatures.bridgeCore.create();
+  const collection = h.window.__wmBridgeFeatures.bridgeCollection.create({core});
+  const results = [];
+  h.window.addEventListener('wm-average-all-collection', e => results.push(e.detail));
+  return { ...h, core, collection, pages, results };
+}
+async function settle(h, run) {
+  let done = false;
+  run.then(() => { done = true; }, () => { done = true; });
+  for (let i = 0; i < 200 && !done; i++) {
+    await new Promise(resolve => setImmediate(resolve));
+    await h.advance(1000);
+  }
+}
+const entry = (id, title = id) => ({id:`o-${id}`, card_id:id, card:{id, wikipedia_title:title, rarity:'C'}, count:1});
+const untitled = {id:'o-x', card_id:'x', card:{id:'x', rarity:'C'}, count:1};
+
+test('les minuteurs passent par un Worker et retombent sur setTimeout s’il échoue', async () => {
+  const workers = [];
+  class FakeWorker { constructor() { this.sent = []; workers.push(this); } postMessage(message) { this.sent.push(message); } }
+  const h = harness(['bridge/core.js'], { Worker: FakeWorker, Blob: class {}, URL: { createObjectURL: () => 'blob:x' } });
+  const { timer } = h.window.__wmBridgeFeatures;
+  let fired = 0;
+
+  const id = timer.set(() => fired++, 5000);
+  assert.equal(workers.length, 1);
+  assert.equal(JSON.stringify(workers[0].sent), JSON.stringify([{ id, ms: 5000 }]));
+  workers[0].onmessage({ data: id });
+  assert.equal(fired, 1);
+
+  const cancelled = timer.set(() => fired++, 1000);
+  timer.clear(cancelled);
+  workers[0].onmessage({ data: cancelled });
+  assert.equal(fired, 1);
+
+  timer.set(() => fired++, 3000);
+  workers[0].onerror();
+  await h.advance(2999); assert.equal(fired, 1);
+  await h.advance(1); assert.equal(fired, 2);
+});
+
+test('un 403 sur la collection est retenté après une pause, puis réussit', async () => {
+  const h = harness(['bridge/core.js']);
+  let calls = 0;
+  h.window.fetch = async () => ++calls === 1 ? new Response('blocked',{status:403}) : response({ok:true});
+  const core = h.window.__wmBridgeFeatures.bridgeCore.create();
+  const run = core.fetchJsonRetry('/api/my-collection',{}, {label:'Collection page 117'});
+  await flush();
+  assert.equal(calls,1);
+  await h.advance(2999); assert.equal(calls,1);
+  await h.advance(1);
+  assert.deepEqual(await run,{ok:true});
+  assert.equal(calls,2);
+});
+
+test('un 403 persistant échoue après trois essais avec le statut sur l’erreur', async () => {
+  const h = harness(['bridge/core.js']);
+  let calls = 0;
+  h.window.fetch = async () => { calls++; return new Response('blocked',{status:403}); };
+  const core = h.window.__wmBridgeFeatures.bridgeCore.create();
+  const run = core.fetchJsonRetry('/api/my-collection',{}, {label:'Collection page 117'});
+  const rejected = assert.rejects(run, error => error.status === 403 && /Collection page 117: HTTP 403/.test(error.message));
+  await flush(); await h.advance(60000); await rejected;
+  assert.equal(calls,3);
+});
+
+test('HTTP 403 sur les prix suspend la file comme une limitation', async () => {
+  let calls=0;
+  const h = salesHarness(async () => {calls++; return new Response('blocked',{status:403});});
+  await flush();
+  assert.equal(calls,1);
+  assert.equal(h.results[0].rateLimited,true);
+  assert.equal(h.results[0].retryAfterMs,60000);
+});
+
+const blockResponse = (h, requests) => requests.forEach(request =>
+  h.send('wm-average-response',{...request,ok:false,rateLimited:true,retryAfterMs:60000}));
+
+test('une carte bloquée par le site est retentée après la pause au lieu d’être perdue', async () => {
+  const h = loaderHarness();
+  h.loader.loadCacheForCards(['a','b'].map(id => ({...card,id})),{markBulk:true});
+  blockResponse(h,[h.requests[0]]);
+  assert.equal(h.core.cacheMemory.has('a'),false);
+  assert.deepEqual(h.progress.at(-1),[2,2,true,0]);
+  blockResponse(h,[h.requests[1]]);
+  await h.advance(999); assert.equal(h.requests.length,2);
+  await h.advance(1);
+  assert.equal(h.requests.length,3);
+  assert.equal(h.requests[2].id,'a');
+});
+
+test('après un blocage, une seule sonde à la fois, espacée selon Fibonacci : 1, 2, 3, 5 s', async () => {
+  const h = loaderHarness();
+  h.loader.loadCacheForCards(['a','b','c'].map(id => ({...card,id})));
+
+  blockResponse(h,h.requests.slice(0,3));
+  let sent = h.requests.length;
+  for (const waitMs of [1000, 2000, 3000, 5000]) {
+    await h.advance(waitMs - 1); assert.equal(h.requests.length,sent);
+    await h.advance(1); assert.equal(h.requests.length,sent + 1);
+    sent += 1;
+    blockResponse(h,[h.requests[sent - 1]]);
+  }
+});
+
+test('le rythme est déduit du blocage : séries réussies puis durée jusqu’à la réouverture', async () => {
+  const h = loaderHarness();
+  h.loader.loadCacheForCards(Array.from({length:20},(_,n) => ({...card,id:`c${n}`})));
+  const ok = request => h.send('wm-average-response',{...request,ok:true,averages:{C:1}});
+
+  h.requests.slice(0,3).forEach(ok);
+  h.requests.slice(3,6).forEach(ok);
+  blockResponse(h,h.requests.slice(6,9));
+  assert.equal(h.requests.length,9);
+
+  // Trois sondes bloquées (à 1, 3 et 6 s), la quatrième passe à 11 s.
+  for (const waitMs of [1000, 2000, 3000]) {
+    await h.advance(waitMs);
+    blockResponse(h,[h.requests.at(-1)]);
+  }
+  await h.advance(5000);
+  assert.equal(h.requests.length,13);
+  ok(h.requests[12]);
+
+  // 6 requêtes tolérées pour 11 s de série + blocage : 11000 × 1,15 / 6 ≈ 2108 ms entre deux requêtes.
+  await h.advance(2107); assert.equal(h.requests.length,13);
+  await h.advance(1); assert.equal(h.requests.length,14);
+});
+
+test('le temps sans requête avant une série n’entre pas dans le calcul du rythme', async () => {
+  const h = loaderHarness();
+  const ok = request => h.send('wm-average-response',{...request,ok:true,averages:{C:1}});
+  h.loader.loadCacheForCards(['x0','x1','x2'].map(id => ({...card,id})));
+  h.requests.forEach(ok);
+  await h.advance(360000);
+
+  const base = h.requests.length;
+  h.loader.loadCacheForCards(Array.from({length:20},(_,n) => ({...card,id:`c${n}`})));
+  h.requests.slice(base,base + 3).forEach(ok);
+  h.requests.slice(base + 3,base + 6).forEach(ok);
+  blockResponse(h,h.requests.slice(base + 6,base + 9));
+  for (const waitMs of [1000, 2000, 3000]) {
+    await h.advance(waitMs);
+    blockResponse(h,[h.requests.at(-1)]);
+  }
+  await h.advance(5000);
+  ok(h.requests.at(-1));
+
+  // Même résultat que sans le silence de 6 minutes : 11000 × 1,15 / 6 ≈ 2108 ms.
+  const sent = h.requests.length;
+  await h.advance(2107); assert.equal(h.requests.length,sent);
+  await h.advance(1); assert.equal(h.requests.length,sent + 1);
+});
+
+test('une série trop courte pour conclure ne ralentit pas le rythme à chaque blocage', async () => {
+  const h = loaderHarness();
+  h.loader.loadCacheForCards(Array.from({length:20},(_,n) => ({...card,id:`c${n}`})));
+  const ok = request => h.send('wm-average-response',{...request,ok:true,averages:{C:1}});
+
+  blockResponse(h,h.requests.slice(0,3));
+  await h.advance(1000); ok(h.requests.at(-1));
+  for (let episode = 0; episode < 3; episode++) {
+    let sent = h.requests.length;
+    await h.advance(1999); assert.equal(h.requests.length,sent);
+    await h.advance(1); assert.equal(h.requests.length,sent + 1);
+    blockResponse(h,[h.requests.at(-1)]);
+    await h.advance(2000); assert.equal(h.requests.length,sent + 2);
+    ok(h.requests.at(-1));
+  }
+});
+
+test('un ancien rythme enregistré sans version est ignoré', () => {
+  const store = new Map([['wm_price_pace_v1', JSON.stringify({gapMs:5063,savedAt:Date.parse('2026-10-05T12:00:00Z')})]]);
+  const h = loaderHarness({ localStorage: {
+    getItem: key => store.has(key) ? store.get(key) : null,
+    setItem: (key, value) => store.set(key, value)
+  }});
+  h.loader.loadCacheForCards(['a','b'].map(id => ({...card,id})));
+  assert.equal(h.requests.length,2);
+});
+
+test('la pause d’un autre onglet est respectée avant toute requête', async () => {
+  const store = new Map([['wm_price_block_until_v1', String(Date.parse('2026-10-05T12:00:00Z') + 30000)]]);
+  const h = loaderHarness({ localStorage: {
+    getItem: key => store.has(key) ? store.get(key) : null,
+    setItem: (key, value) => store.set(key, value)
+  }});
+  h.loader.loadCacheForCards([card]);
+  assert.equal(h.requests.length,0);
+  await h.advance(29999); assert.equal(h.requests.length,0);
+  await h.advance(1); assert.equal(h.requests.length,1);
+});
+
+test('la liste du Marketplace est lue, mais pas la requête « mine=1 » de Mes enchères', () => {
+  const h = harness(['bridge/core.js']);
+  h.window.fetch = async () => response({});
+  const core = h.window.__wmBridgeFeatures.bridgeCore.create();
+  const lists = [];
+  h.window.addEventListener('wm-average-marketplace-list', e => lists.push(e.detail.auctions));
+
+  assert.equal(core.isMarketplaceListApi('/api/marketplace?page=1&limit=24'),true);
+  assert.equal(core.isMarketplaceListApi('/api/marketplace?page=1&limit=1&mine=1'),false);
+  assert.equal(core.isMarketplaceListApi('/api/marketplace/00000000-0000-4000-8000-000000000000'),false);
+
+  core.emitMarketplaceList({total:2, auctions:[
+    {id:'l1', card_id:'a', current_bid:12, snapshot_rarity:'UR', card:{wikipedia_title:'A'}},
+    {id:'l2', base_amount:30, card:{id:'b', wikipedia_title:'B', rarity:'L'}},
+    {id:'l3', card_id:'c', card:{}}
+  ]});
+  assert.equal(JSON.stringify(lists), JSON.stringify([[
+    {id:'l1', price:12, card:{id:'a', title:'A', rarity:'UR', imageUrl:null}},
+    {id:'l2', price:30, card:{id:'b', title:'B', rarity:'L', imageUrl:null}}
+  ]]));
+});
+
+test('une carte demandée en priorité passe devant la file d’un chargement complet', async () => {
+  const h = loaderHarness();
+  h.loader.loadCacheForCards(['a','b','c','d','e'].map(id => ({...card, id})));
+  assert.equal(h.requests.length,3);
+
+  h.loader.loadCacheForCards([{...card,id:'e'},{...card,id:'x'}], {priority:true});
+  h.send('wm-average-response',{...h.requests[0],ok:true,averages:{C:1}});
+  h.send('wm-average-response',{...h.requests[1],ok:true,averages:{C:1}});
+  await flush();
+  assert.deepEqual(h.requests.slice(3).map(request => request.id),['e','x']);
+});
+
+test('le prix des communes et des cartes à moins de 5 W reste valide 7 jours, les autres 24 h', () => {
+  const h = loaderHarness();
+  h.loader.loadCacheForCards([{...card,id:'c1',rarity:'C'},{...card,id:'r1',rarity:'R'},{...card,id:'r2',rarity:'R'}]);
+  h.requests.forEach(request => h.send('wm-average-response',{...request,ok:true,averages:{C:1,R:request.id === 'r2' ? 2 : 100}}));
+
+  const now = Date.parse('2026-10-05T12:00:00Z');
+  const day = 24 * 60 * 60 * 1000;
+  assert.equal(h.core.isCacheEntryValid(h.core.cacheMemory.get('c1'), now + 3 * day),true);
+  assert.equal(h.core.isCacheEntryValid(h.core.cacheMemory.get('c1'), now + 8 * day),false);
+  assert.equal(h.core.isCacheEntryValid(h.core.cacheMemory.get('r1'), now + 25 * 60 * 60 * 1000),false);
+  assert.equal(h.core.isCacheEntryValid(h.core.cacheMemory.get('r2'), now + 3 * day),true);
+});
+
+test('une moyenne de 0 n’est pas traitée comme une carte bon marché', () => {
+  const h = loaderHarness();
+  h.loader.loadCacheForCards([{...card,id:'r0',rarity:'R'}]);
+  h.requests.forEach(request => h.send('wm-average-response',{...request,ok:true,averages:{R:0}}));
+
+  const now = Date.parse('2026-10-05T12:00:00Z');
+  assert.equal(h.core.isCacheEntryValid(h.core.cacheMemory.get('r0'), now + 25 * 60 * 60 * 1000),false);
+});
+
+test('une carte vue au Marketplace ou en enchère ne garde ni rareté ni compte si elle est possédée', () => {
+  const h = priceHarness();
+  h.core.registerCards([{id:'a', title:'A', rarity:'C', ownedCardId:'o1', ownedCardIds:['o1','o2'], count:2}]);
+
+  const unowned = h.core.preserveOwnedMeta({id:'b', title:'B', rarity:'UR', imageUrl:'https://x/b.webp'});
+  assert.equal(unowned.rarity,'UR');
+  assert.equal(unowned.count,1);
+
+  const owned = h.core.preserveOwnedMeta({id:'a', title:'A', rarity:'UR', imageUrl:'https://x/a-foil.webp'});
+  assert.equal(owned.rarity,'C');
+  assert.equal(owned.imageUrl,null);
+  assert.equal(owned.count,2);
+});
+
+test('une image introuvable à cause d’une erreur réseau n’est pas mémorisée comme absente', async () => {
+  const store = new Map();
+  let failing = true;
+  const h = harness(['features/image-resolver.js'], {
+    URLSearchParams,
+    fetch: async () => {
+      if (failing) throw new Error('HTTP 429');
+      return new Response(JSON.stringify({search:[], query:{pages:{}}}), {status:200});
+    }
+  });
+  const resolver = h.window.__wmAverageFeatures.imageResolver.create({
+    normalizeTitle: value => String(value || '').trim(),
+    readLocalValue: key => store.get(key), writeLocalValue: (key, value) => store.set(key, value),
+    MISSING_IMAGE_CACHE_PREFIX: 'img_', MISSING_IMAGE_FOUND_TTL: 1e9, MISSING_IMAGE_MISS_TTL: 1e9
+  });
+
+  const failed = await resolver.resolveMissingImage('Chat');
+  assert.equal(failed.error,true);
+  assert.equal(store.size,0);
+
+  failing = false;
+  const missing = await resolver.resolveMissingImage('Chat');
+  assert.equal(missing.found,false);
+  assert.equal(store.size,1);
+});
+
+test('une illustration est un GIF seulement si l’adresse finit par .gif', () => {
+  const {core} = priceHarness();
+  assert.equal(core.isGifImage('https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Chat.gif/330px-Chat.gif'),true);
+  assert.equal(core.isGifImage('https://cdn.example.com/cards/a.GIF?v=2'),true);
+  assert.equal(core.isGifImage('https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Chat.gif/330px-Chat.gif.png'),false);
+  assert.equal(core.isGifImage('https://cdn.example.com/cards/a.webp'),false);
+  assert.equal(core.isGifImage('data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP'),false);
+  assert.equal(core.isGifImage(null),false);
+});
+
+test('la liste du Marketplace n’est traitée que sur la page Marketplace, pas masquée par Mes enchères', () => {
+  const elsewhere = priceHarness({location:{origin:'https://www.wiki-masters.com', pathname:'/pulls'}});
+  elsewhere.send('wm-average-marketplace-list', {auctions:[{id:'l1', price:10, card:{id:'a', title:'A', rarity:'C'}}]});
+  assert.equal(elsewhere.core.cardMetaById.has('a'), false);
+
+  const h = priceHarness({location:{origin:'https://www.wiki-masters.com', pathname:'/marketplace'}});
+  h.send('wm-average-marketplace-list', {auctions:[{id:'l1', price:10, card:{id:'a', title:'A', rarity:'C'}}]});
+  assert.equal(h.core.cardMetaById.has('a'), true);
+
+  h.runtime.myBids = {isBidsPage:() => true};
+  h.send('wm-average-marketplace-list', {auctions:[{id:'l2', price:10, card:{id:'b', title:'B', rarity:'C'}}]});
+  assert.equal(h.core.cardMetaById.has('b'), false);
+});
+
+test('une carte sans titre en page 0 ne crée pas de page hors bornes', async () => {
+  const h = collectionHarness(({stats,page}) => response(stats ? {} : {
+    total:6, collection: page === 0 ? [entry('a'),entry('b'),untitled] : [entry('c'),entry('d'),entry('e')]
+  }));
+  const run = h.collection.fetchAllCollection('r',[]);
+  await settle(h,run);
+  assert.deepEqual(h.pages,[0,1]);
+  assert.equal(h.results[0].ok,true);
+  assert.equal(h.results[0].complete,true);
+  assert.equal(h.results[0].cards.length,5);
+});
+
+test('avec la rareté C cochée, les stats de rareté ne raccourcissent pas le chargement', async () => {
+  const h = collectionHarness(({stats,page}) => response(stats ? {rarityCounts:{C:1}} : {
+    total:6, collection: page === 0 ? [entry('a'),entry('b'),entry('c')] : [entry('d'),entry('e'),entry('f')]
+  }));
+  const run = h.collection.fetchAllCollection('r',['C']);
+  await settle(h,run);
+  assert.deepEqual(h.pages,[0,1]);
+  assert.equal(h.results[0].complete,true);
+});
+
+test('un quota plein libère les prix en échec et les images expirées, garde les prix valides', () => {
+  const store = new Map([
+    ['wm_avg_v4_bad', JSON.stringify({ok:false,fetchedAt:1,averages:{}})],
+    ['wm_avg_v4_good', JSON.stringify({ok:true,fetchedAt:Date.parse('2026-10-05T12:00:00Z'),averages:{}})],
+    ['wm_missing_img_v2_old', JSON.stringify({found:false,fetchedAt:1})]
+  ]);
+  const localStorage = {
+    get length() { return store.size; },
+    key: index => [...store.keys()][index] ?? null,
+    getItem: key => store.has(key) ? store.get(key) : null,
+    removeItem: key => store.delete(key),
+    setItem(key, value) {
+      if (!store.has(key) && store.size >= 3) throw new Error('QuotaExceededError');
+      store.set(key, value);
+    }
+  };
+  const h = priceHarness({ localStorage });
+
+  assert.equal(h.core.writeLocalValue('wm_new', {a:1}), true);
+  assert.deepEqual([...store.keys()].sort(), ['wm_avg_v4_good','wm_new']);
+});
+
+test('vider le cache efface le recalculable et garde réglages, familles et statistiques', () => {
+  const keep = ['wm_feature_settings_v1','wm_families_v1','wm_pull_stats_v1','wm_auto_open_min_minutes_v1','wm_my_bids_sound_v1','autre_cle_du_site'];
+  const clear = ['wm_avg_v4_a','wm_avg_v3_old','wm_missing_img_v2_x','wm_all_collection_v1','wm_price_pace_v1','wm_price_block_until_v1','wm_bulk_rarity_last_load_v1','wm_avg_cache_cleanup_v1'];
+  const store = new Map([...keep, ...clear].map(key => [key, JSON.stringify({key})]));
+  const localStorage = {
+    get length() { return store.size; },
+    key: index => [...store.keys()][index] ?? null,
+    getItem: key => store.has(key) ? store.get(key) : null,
+    removeItem: key => store.delete(key),
+    setItem: (key, value) => store.set(key, value)
+  };
+  const h = priceHarness({ localStorage });
+  h.core.cacheMemory.set('a',{ok:true});
+
+  const result = h.core.clearCaches();
+  assert.equal(result.removed,clear.length);
+  assert.deepEqual([...store.keys()].sort(), [...keep].sort());
+  assert.equal(h.core.cacheMemory.size,0);
+});
+
+function memoryStorage(entries = []) {
+  const store = new Map(entries);
+  return { store, localStorage: {
+    get length() { return store.size; },
+    key: index => [...store.keys()][index] ?? null,
+    getItem: key => store.has(key) ? store.get(key) : null,
+    setItem: (key, value) => store.set(key, String(value)),
+    removeItem: key => store.delete(key)
+  }};
+}
+const img = name => `https://cdn.example.com/storage/v1/object/public/cards/${name}.webp`;
+const fullCards = [
+  {id:'a', ownedCardId:'o1', ownedCardIds:['o1'], title:'A', rarity:'C', imageUrl:img('a'), count:1, starred:false, tags:[]},
+  {id:'b', ownedCardId:'o3', ownedCardIds:['o2','o3'], title:'B', rarity:'R', imageUrl:img('b'), count:2, starred:true, tags:[{id:'t',name:'T',color:null}]},
+  {id:'c', ownedCardId:null, ownedCardIds:['o4'], title:'C', rarity:'SR', imageUrl:'https://autre.example.org/c.png', count:1, starred:false, tags:[]},
+  {id:'d', ownedCardId:null, ownedCardIds:[], title:'D', rarity:'UR', imageUrl:null, count:3, starred:false, tags:[]}
+];
+
+// L'ordre des clés d'une carte peut changer après compactage : seul le contenu compte.
+const sameCards = (actual, expected) => assert.equal(
+  JSON.stringify(actual.map(card => Object.fromEntries(Object.entries(card).sort()))),
+  JSON.stringify(expected.map(card => Object.fromEntries(Object.entries(card).sort())))
+);
+
+// Juste ce que core.js utilise d'IndexedDB : open, transaction, get, put, delete.
+function fakeIndexedDB(entries = []) {
+  const data = new Map(entries);
+  const later = fn => Promise.resolve().then(fn);
+  const db = { transaction() {
+    const tx = {};
+    const done = request => { later(() => tx.oncomplete()); return request; };
+    tx.objectStore = () => ({
+      get: key => done({ result: structuredClone(data.get(key)) }),
+      put: (value, key) => done(data.set(key, structuredClone(value)) && {}),
+      delete: key => done(data.delete(key) && {})
+    });
+    return tx;
+  }};
+  return { data, indexedDB: { open() { const request = { result: db }; later(() => request.onsuccess()); return request; } } };
+}
+
+test('la collection est enregistrée dans IndexedDB, plus dans localStorage, et relue au rechargement', async () => {
+  const { store, localStorage } = memoryStorage();
+  const { data, indexedDB } = fakeIndexedDB();
+  const h = priceHarness({ localStorage, indexedDB });
+  const key = h.core.ALL_COLLECTION_KEY;
+  h.core.storageSet({[key]:{fetchedAt:1, complete:true, cards:fullCards}});
+  await flush();
+
+  assert.equal(store.has(key), false);
+  sameCards(data.get(key).cards, fullCards);
+
+  const reloaded = priceHarness({ localStorage, indexedDB });
+  await reloaded.core.collectionReady;
+  const read = reloaded.core.storageGet(key)[key];
+  assert.equal(read.fetchedAt, 1);
+  assert.equal(read.complete, true);
+  sameCards(read.cards, fullCards);
+});
+
+test('modifier la collection lue ne change pas la copie gardée tant qu’elle n’est pas réenregistrée', () => {
+  const h = priceHarness();
+  const key = h.core.ALL_COLLECTION_KEY;
+  h.core.storageSet({[key]:{fetchedAt:1, cards:[{id:'a', count:1}]}});
+  h.core.storageGet(key)[key].cards[0].count = 9;
+  assert.equal(h.core.storageGet(key)[key].cards[0].count, 1);
+});
+
+test('une collection de localStorage, compacte ou non, passe dans IndexedDB au démarrage', async () => {
+  const compact = {v:2, fetchedAt:1, complete:true, imagePrefix:img('').slice(0, -5), cards:[
+    {id:'a', ownedCardIds:['o1'], title:'A', rarity:'C', img:'a.webp'},
+    {id:'b', ownedCardId:'o3', ownedCardIds:['o2','o3'], title:'B', rarity:'R', img:'b.webp', count:2, starred:true, tags:[{id:'t',name:'T',color:null}]},
+    {id:'c', ownedCardId:null, ownedCardIds:['o4'], title:'C', rarity:'SR', imageUrl:'https://autre.example.org/c.png'},
+    {id:'d', title:'D', rarity:'UR', count:3}
+  ]};
+  for (const legacy of [{fetchedAt:1, complete:true, cards:fullCards}, compact]) {
+    const { store, localStorage } = memoryStorage([['wm_all_collection_v1', JSON.stringify(legacy)]]);
+    const { data, indexedDB } = fakeIndexedDB();
+    const h = priceHarness({ localStorage, indexedDB });
+    await h.core.collectionReady;
+
+    assert.equal(store.has('wm_all_collection_v1'), false);
+    sameCards(data.get('wm_all_collection_v1').cards, fullCards);
+    sameCards(h.core.storageGet('wm_all_collection_v1').wm_all_collection_v1.cards, fullCards);
+  }
+});
+
+test('sans IndexedDB, la collection reste utilisable et sa copie localStorage n’est pas effacée', async () => {
+  const { store, localStorage } = memoryStorage([['wm_all_collection_v1', JSON.stringify({fetchedAt:1, cards:fullCards})]]);
+  const h = priceHarness({ localStorage });
+  await h.core.collectionReady;
+
+  assert.equal(store.has('wm_all_collection_v1'), true);
+  sameCards(h.core.storageGet('wm_all_collection_v1').wm_all_collection_v1.cards, fullCards);
+});
+
+test('vider le cache efface aussi la collection d’IndexedDB', async () => {
+  const { localStorage } = memoryStorage();
+  const { data, indexedDB } = fakeIndexedDB([['wm_all_collection_v1', {fetchedAt:1, cards:fullCards}]]);
+  const h = priceHarness({ localStorage, indexedDB });
+  await h.core.collectionReady;
+
+  h.core.clearCaches();
+  await flush();
+  assert.equal(data.has('wm_all_collection_v1'), false);
+  assert.equal(h.core.storageGet('wm_all_collection_v1').wm_all_collection_v1, undefined);
+});
+
+test('les cartes persistées perdent wikipediaUrl, jamais relue depuis ce cache', () => {
+  const h = priceHarness();
+  assert.equal(
+    JSON.stringify(h.core.toStoredCard({id:'a', title:'A', wikipediaUrl:'https://fr.wikipedia.org/wiki/A', count:2})),
+    JSON.stringify({id:'a', title:'A', count:2})
+  );
+});
+
+test('une erreur tardive garde les pages déjà lues et les signale comme partielles', async () => {
+  const h = collectionHarness(({stats,page}) => {
+    if (stats) return response({});
+    if (page === 2) return new Response('blocked',{status:403});
+    return response({total:9, collection:[1,2,3].map(n => entry(`p${page}-${n}`))});
+  });
+  const run = h.collection.fetchAllCollection('r',[]);
+  await settle(h,run);
+  assert.equal(h.results[0].ok,true);
+  assert.equal(h.results[0].complete,false);
+  assert.match(h.results[0].partialError,/Collection page 2: HTTP 403/);
+  assert.equal(h.results[0].cards.length,6);
+  assert.deepEqual(h.pages,[0,1,2,2,2]);
 });

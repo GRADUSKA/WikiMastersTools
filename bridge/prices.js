@@ -11,10 +11,13 @@
 
         let lastError = null;
         let lastRetryAfterMs = 60000;
+        // Attente demandée par le serveur (en-tête Retry-After), 0 s'il n'en donne pas.
+        let retryAfterHintMs = 0;
 
         for (let attempt = 1; attempt <= 3; attempt += 1) {
           const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 10000);
+          // Le site met parfois plus de 10 s à répondre : abandonner trop tôt ne fait que le surcharger.
+          const timeout = setTimeout(() => controller.abort(), 25000);
           try {
             const response = await originalFetch(
               `/api/marketplace/cards/${encodeURIComponent(id)}/sales?scope=summary`,
@@ -32,6 +35,7 @@
               const seconds = Number(header);
               const delay = header == null ? 0 : (Number.isFinite(seconds) ? seconds * 1000 : Date.parse(header) - Date.now());
               lastRetryAfterMs = Math.max(60000, Math.min(300000, delay || 0));
+              retryAfterHintMs = Math.max(0, Math.min(300000, delay || 0));
               lastError = new Error(`HTTP ${response.status}`);
 
               if (!retryable || attempt >= 3) {
@@ -90,7 +94,8 @@
             id,
             ok: false,
             retryAfterMs: lastRetryAfterMs,
-            rateLimited: String(lastError?.message).includes('HTTP 429'),
+            retryAfterHintMs,
+            rateLimited: /HTTP (429|403)/.test(String(lastError?.message)),
             error: String(lastError?.message || lastError || 'Erreur réseau')
           }
         }));

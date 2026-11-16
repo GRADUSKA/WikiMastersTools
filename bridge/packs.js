@@ -20,7 +20,11 @@
           throw new Error('Ce navigateur ne permet pas de sécuriser les ouvertures entre onglets.');
         }
         return navigator.locks.request(LOCK_NAME, { ifAvailable: true }, (lock) => {
-          if (!lock) throw new Error('Une ouverture est déjà en cours dans un autre onglet.');
+          if (!lock) {
+            const busy = new Error('Une ouverture est déjà en cours dans un autre onglet.');
+            busy.code = 'LOCK_BUSY';
+            throw busy;
+          }
           return action();
         });
       }
@@ -57,6 +61,7 @@
         let openedPacks = 0;
         let packsRemaining = null;
         let error = null;
+        let lockBusy = false;
 
         const progress = (extra) => emit('progress', {
           requestId, openedPacks, cardsCount: allCards.length, packsRemaining, ...extra
@@ -78,7 +83,8 @@
                     method: 'POST', credentials: 'include', headers: { accept: '*/*' },
                     signal: requestController.signal
                   });
-                  json = await response.json();
+                  // Un blocage 403/429 du site arrive souvent sans JSON : ce n'est pas une réponse perdue.
+                  json = await response.json().catch(() => null);
                 } catch (_) {
                   throw new Error('Réponse d’ouverture perdue. Vérifiez votre collection avant de relancer : le paquet peut avoir été consommé.');
                 } finally {
@@ -87,13 +93,17 @@
 
                 packsRemaining = remainingCount(json?.packs_remaining);
                 const cards = mapPackCards(json);
-                const retryAt = Date.parse(json?.retry_after || '');
-                if (!cards.length && json?.rate_limited && !json?.rate_limit_daily && Number.isFinite(retryAt)) {
+                const blocked = !json && (response.status === 403 || response.status === 429);
+                const retryAfterS = Number(response.headers?.get?.('retry-after'));
+                const retryAt = blocked
+                  ? Date.now() + (retryAfterS > 0 ? retryAfterS * 1000 : 60000)
+                  : Date.parse(json?.retry_after || '');
+                if (!cards.length && (json?.rate_limited || blocked) && !json?.rate_limit_daily && Number.isFinite(retryAt)) {
                   const waitMs = Math.max(250, retryAt - Date.now() + 200);
                   if (++rateLimitRetries > 5 || waitMs > 5 * 60 * 1000) {
                     throw new Error('Ouverture suspendue : délai ou nombre de tentatives du serveur dépassé.');
                   }
-                  progress({ waiting: true, retryAfter: json.retry_after, waitMs });
+                  progress({ waiting: true, retryAfter: json?.retry_after || new Date(retryAt).toISOString(), waitMs });
                   await wait(waitMs, signal);
                   continue;
                 }
@@ -119,11 +129,12 @@
           });
         } catch (caught) {
           error = String(caught?.message || caught);
+          lockBusy = caught?.code === 'LOCK_BUSY';
         } finally {
           activeBatch = null;
           emit('result', {
             requestId, ok: error == null, cancelled: signal.aborted,
-            openedPacks, cards: allCards, packsRemaining, error
+            openedPacks, cards: allCards, packsRemaining, error, lockBusy
           });
         }
       }

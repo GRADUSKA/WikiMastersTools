@@ -17,11 +17,14 @@
         if (isCollectionPage()) {
           runtime.collectionBulk.ensureToolbar();
           runtime.collectionBulk.ensurePriceLegend();
+          runtime.gifView.render();
           runtime.priceUi.renderVisibleCollectionCards();
         }
 
         if (isMarketplaceDetailPage()) {
           runtime.priceUi.renderMarketplaceCurrent();
+        } else if (isMarketplacePage()) {
+          runtime.priceUi.renderMarketplaceDeals();
         }
 
         if (isPullsPage()) {
@@ -82,10 +85,10 @@
       }
 
       function scheduleRender(delay = 70) {
-        if (!routeIsSupported()) return;
-
         clearTimeout(renderTimer);
         renderTimer = setTimeout(() => {
+          if (!routeIsSupported()) return;
+
           try {
             renderAll();
           } catch (error) {
@@ -107,7 +110,7 @@
             '.wm-wikipedia-card-button, .wm-missing-image-credit, .wm-missing-title-art, .wm-compact-tools, .wm-price-legend, ' +
             '.wm-auto-open-control, .wm-auto-open-help, .wm-settings-launch, .wm-settings-modal, ' +
             '.wm-copy-card-button, .wm-trade-preview-card, #wm-theme-tracker-page, #wm-theme-tracker-nav, ' +
-            '#wm-my-bids-page, #wm-my-bids-nav'
+            '#wm-my-bids-page, #wm-my-bids-nav, .wm-market-deal'
           )
         );
       }
@@ -144,9 +147,8 @@
         attachMainObserver();
 
         const hasOutsideChange = mutations.some((mutation) => {
-          if (mutationIsExtensionOwned(mutation)) return false;
-          if (!previousMain) return true;
-          return !previousMain.contains(mutation.target);
+          if (previousMain?.contains(mutation.target)) return false;
+          return !mutationIsExtensionOwned(mutation);
         });
 
         if (pathChanged || hasOutsideChange || previousMain !== observedMain) {
@@ -160,7 +162,8 @@
           return;
         }
 
-        cleanupPriceCacheOnceDaily();
+        // Relit ~10 000 prix une fois par jour : après le premier affichage, pas avant.
+        setTimeout(cleanupPriceCacheOnceDaily, 5000);
         attachMainObserver();
 
         if (runtime.packs.isAutoOpenEnabled()) {
@@ -180,8 +183,6 @@
         attachMainObserver();
         scheduleRender(0);
       });
-
-      console.debug('[WM Average] app module v4.15.2 prêt');
 
       return { startObserver };
     }

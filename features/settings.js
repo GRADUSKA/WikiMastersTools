@@ -15,6 +15,8 @@
         hideCardStats: true,
         collectionPrices: true,
         marketplacePrice: true,
+        marketplaceDeals: true,
+        gifView: true,
         globalCollectionPrice: true,
         bulkPriceLoader: true,
         ranking: true,
@@ -49,11 +51,13 @@
           items: [
             ['collectionPrices', 'Prix moyens dans la collection', 'Affiche les badges de prix moyen directement sur les cartes de la collection.'],
             ['marketplacePrice', 'Prix moyen sur Marketplace', 'Affiche le prix moyen sur la fiche d’une annonce Marketplace.'],
+            ['marketplaceDeals', 'Bonnes affaires sur Marketplace', 'Affiche la moyenne et l’écart de prix sur chaque annonce de la liste. Charge au plus 20 prix L, UR ou SR manquants par page.'],
             ['globalCollectionPrice', 'Prix dans la collection globale', 'Affiche le prix moyen quand une carte est inspectée dans la collection globale.'],
             ['bulkPriceLoader', 'Chargement massif des prix', 'Ajoute « Charger les prix » avec sélection des raretés.'],
             ['ranking', 'Classement « Plus chères »', 'Ajoute le classement des cartes connues par prix moyen.'],
             ['rankingSales', 'Mise en vente depuis le classement', 'Affiche les contrôles pour mettre directement une carte en vente depuis le classement.'],
-            ['compactMode', 'Mode compact', 'Ajoute le bouton Compact dans les vues collection.']
+            ['compactMode', 'Mode compact', 'Ajoute le bouton Compact dans les vues collection.'],
+            ['gifView', 'Cartes GIF', 'Ajoute le bouton « GIFs » à la collection : affiche les cartes dont l’illustration du site est un GIF.']
           ]
         },
         {
@@ -149,16 +153,34 @@
         return interval;
       }
 
+      // isEnabled est appelé pour chaque carte : on ne re-parse que si la valeur stockée a changé.
+      let cachedSettingsRaw = null;
+      let cachedSettings = null;
+
+      function readSettings() {
+        let raw = null;
+        try {
+          raw = localStorage.getItem(SETTINGS_KEY);
+        } catch (_) {}
+
+        if (!cachedSettings || raw !== cachedSettingsRaw) {
+          const saved = readLocalValue(SETTINGS_KEY);
+          cachedSettingsRaw = raw;
+          cachedSettings = {
+            ...DEFAULTS,
+            ...(saved && typeof saved === 'object' ? saved : {})
+          };
+        }
+
+        return cachedSettings;
+      }
+
       function getSettings() {
-        const saved = readLocalValue(SETTINGS_KEY);
-        return {
-          ...DEFAULTS,
-          ...(saved && typeof saved === 'object' ? saved : {})
-        };
+        return { ...readSettings() };
       }
 
       function isEnabled(key) {
-        return getSettings()[key] !== false;
+        return readSettings()[key] !== false;
       }
 
       function saveSettings(settings) {
@@ -337,6 +359,59 @@
           section.append(sectionHead, list);
           body.append(section);
         }
+
+        const dataSection = document.createElement('section');
+        dataSection.className = 'wm-settings-section';
+
+        const dataHead = document.createElement('div');
+        dataHead.className = 'wm-settings-section-head';
+
+        const dataTitle = document.createElement('h3');
+        dataTitle.textContent = 'Données';
+
+        const dataDescription = document.createElement('p');
+        dataDescription.textContent = 'Ce que l’extension mémorise dans ton navigateur.';
+        dataHead.append(dataTitle, dataDescription);
+
+        const dataList = document.createElement('div');
+        dataList.className = 'wm-settings-list';
+
+        const clearRow = document.createElement('div');
+        clearRow.className = 'wm-settings-row wm-settings-interval-row';
+
+        const clearCopy = document.createElement('span');
+        clearCopy.className = 'wm-settings-copy';
+
+        const clearLabel = document.createElement('strong');
+        clearLabel.textContent = 'Vider le cache';
+
+        const clearDescription = document.createElement('span');
+        clearDescription.textContent = 'Supprime les prix, la collection mémorisée, les images retrouvées et le rythme de chargement appris. Tes réglages, tes familles et tes statistiques de tirage sont conservés.';
+        clearCopy.append(clearLabel, clearDescription);
+
+        const clearButton = document.createElement('button');
+        clearButton.type = 'button';
+        clearButton.className = 'wm-tool-button wm-secondary-button';
+        clearButton.textContent = 'Vider';
+        clearButton.addEventListener('click', () => {
+          if (!confirm('Vider le cache ?\n\nLes prix, la collection mémorisée et les images retrouvées seront supprimés, puis la page sera rechargée. Tes réglages, tes familles et tes statistiques de tirage sont conservés.')) {
+            return;
+          }
+
+          try {
+            core.clearCaches();
+          } catch (_) {
+            clearButton.textContent = 'Impossible';
+            return;
+          }
+
+          location.reload();
+        });
+
+        clearRow.append(clearCopy, clearButton);
+        dataList.append(clearRow);
+        dataSection.append(dataHead, dataList);
+        body.append(dataSection);
 
         const footer = document.createElement('div');
         footer.className = 'wm-settings-footer';

@@ -4,11 +4,15 @@
   registry.core = {
     create() {
       const CACHE_TTL = 24 * 60 * 60 * 1000;
+      // Le prix moyen des communes (C, PC) bouge peu : inutile de le redemander chaque jour.
+      const LONG_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
       const ERROR_CACHE_TTL = 60 * 1000;
       const CACHE_CLEANUP_INTERVAL = 24 * 60 * 60 * 1000;
       const CACHE_MAX_AGE = 30 * 24 * 60 * 60 * 1000;
       const CACHE_CLEANUP_KEY = 'wm_avg_cache_cleanup_v1';
       const CACHE_PREFIX = 'wm_avg_v4_';
+      const PRICE_PACE_KEY = 'wm_price_pace_v1';
+      const PRICE_BLOCK_KEY = 'wm_price_block_until_v1';
       const MAX_CONCURRENT = 3;
       const BULK_RARITY_LAST_LOAD_KEY = 'wm_bulk_rarity_last_load_v1';
       const ALL_COLLECTION_KEY = 'wm_all_collection_v1';
@@ -21,8 +25,6 @@
       const AUTO_OPEN_MAX_MINUTES_KEY = 'wm_auto_open_max_minutes_v1';
       const AUTO_OPEN_DEFAULT_MIN_MINUTES = 20;
       const AUTO_OPEN_DEFAULT_MAX_MINUTES = 100;
-      const AUTO_OPEN_MIN_DELAY = AUTO_OPEN_DEFAULT_MIN_MINUTES * 60 * 1000;
-      const AUTO_OPEN_MAX_DELAY = AUTO_OPEN_DEFAULT_MAX_MINUTES * 60 * 1000;
       const COMPACT_MODE_KEY = 'wm_compact_mode_v1';
       const MISSING_IMAGE_CACHE_PREFIX = 'wm_missing_img_v2_';
       const MISSING_IMAGE_FOUND_TTL = 30 * 24 * 60 * 60 * 1000;
@@ -101,9 +103,50 @@
         }
       }
 
+      function isMissingImageEntryExpired(entry, now = Date.now()) {
+        const fetchedAt = Number(entry?.fetchedAt);
+        if (!fetchedAt) return true;
+        return now - fetchedAt >= (entry.found ? MISSING_IMAGE_FOUND_TTL : MISSING_IMAGE_MISS_TTL);
+      }
+
+      // Quota plein : retire ce qui ne sert plus (échecs de prix, images manquantes expirées).
+      // Le scan lit toutes les clés : au plus un passage par 30 s, même si chaque écriture échoue.
+      let nextStorageCleanupAt = 0;
+
+      function freeStorageSpace() {
+        const now = Date.now();
+        if (now < nextStorageCleanupAt) return false;
+        nextStorageCleanupAt = now + 30000;
+
+        const doomed = [];
+
+        for (let index = 0; index < localStorage.length; index += 1) {
+          const key = localStorage.key(index);
+          if (!key) continue;
+
+          if (key.startsWith(CACHE_PREFIX)) {
+            const entry = readLocalValue(key);
+            if (!entry || entry.ok === false || !Number.isFinite(entry.fetchedAt)) doomed.push(key);
+          } else if (key.startsWith(MISSING_IMAGE_CACHE_PREFIX)) {
+            if (isMissingImageEntryExpired(readLocalValue(key), now)) doomed.push(key);
+          }
+        }
+
+        doomed.forEach((key) => localStorage.removeItem(key));
+        return doomed.length > 0;
+      }
+
       function writeLocalValue(key, value) {
         try {
-          localStorage.setItem(key, JSON.stringify(value));
+          const json = JSON.stringify(value);
+
+          try {
+            localStorage.setItem(key, json);
+          } catch (error) {
+            if (!freeStorageSpace()) throw error;
+            localStorage.setItem(key, json);
+          }
+
           return true;
         } catch (error) {
           console.warn('[WM Average] localStorage indisponible', error);
@@ -111,23 +154,115 @@
         }
       }
 
+      // wikipediaUrl pèse ~90 caractères par carte et n'est jamais relue depuis ce cache.
+      function toStoredCard({ wikipediaUrl, ...card }) {
+        return card;
+      }
+
+      // Ancien format compact de localStorage (v4.32.0) : valeurs par défaut omises, début d'adresse
+      // d'image mis en commun. Seulement relu, pour la migration vers IndexedDB.
+      function expandCard({ img, ...card }, imagePrefix) {
+        const ownedCardIds = Array.isArray(card.ownedCardIds) ? card.ownedCardIds : [];
+        return {
+          ...card,
+          ownedCardId: 'ownedCardId' in card ? card.ownedCardId : (ownedCardIds[0] ?? null),
+          ownedCardIds,
+          imageUrl: typeof img === 'string' ? imagePrefix + img : (card.imageUrl ?? null),
+          starred: card.starred === true,
+          tags: Array.isArray(card.tags) ? card.tags : [],
+          count: card.count ?? 1
+        };
+      }
+
+      function expandCollection(entry) {
+        if (entry?.v !== 2 || !Array.isArray(entry.cards)) return entry;
+        const { v, imagePrefix = '', cards, ...meta } = entry;
+        return { ...meta, cards: cards.map((card) => expandCard(card, imagePrefix)) };
+      }
+
+      // La collection (~5 Mo pour 10 000 cartes) saturait les ~10 Mo de localStorage partagés avec les
+      // prix : elle vit dans IndexedDB, avec une copie en mémoire pour que storageGet reste synchrone.
+      let collectionMemory;
+      let collectionDb;
+      const collectionChannel = typeof BroadcastChannel === 'function' ? new BroadcastChannel(ALL_COLLECTION_KEY) : null;
+      let collectionWrites = 0;
+      // Les autres onglets relisent IndexedDB : envoyer les ~5 Mo dans le message en faisait une copie de plus.
+      // Une écriture locale faite pendant cette relecture est plus récente : elle n'est pas écrasée.
+      if (collectionChannel) collectionChannel.onmessage = () => {
+        const writes = collectionWrites;
+        collectionStore('readonly', (store) => store.get(ALL_COLLECTION_KEY))
+          .then((entry) => { if (writes === collectionWrites) collectionMemory = entry; })
+          .catch((error) => console.debug('[WM Average] collection d’un autre onglet illisible', error));
+      };
+
+      function collectionStore(mode, run) {
+        collectionDb ||= new Promise((resolve, reject) => {
+          const open = indexedDB.open('wm_tools', 1);
+          open.onupgradeneeded = () => open.result.createObjectStore('kv');
+          open.onsuccess = () => resolve(open.result);
+          open.onerror = () => reject(open.error);
+        });
+        return collectionDb.then((db) => new Promise((resolve, reject) => {
+          const tx = db.transaction('kv', mode);
+          const request = run(tx.objectStore('kv'));
+          tx.oncomplete = () => resolve(request.result);
+          tx.onerror = tx.onabort = () => reject(tx.error);
+        }));
+      }
+
+      function saveCollection(entry) {
+        collectionMemory = entry;
+        collectionWrites += 1;
+        const write = entry === undefined
+          ? (store) => store.delete(ALL_COLLECTION_KEY)
+          : (store) => store.put(entry, ALL_COLLECTION_KEY);
+        return collectionStore('readwrite', write).then(() => collectionChannel?.postMessage('changed'));
+      }
+
+      // Une écriture faite pendant la lecture initiale est plus récente : elle n'est pas écrasée.
+      const collectionReady = (async () => {
+        const legacy = readLocalValue(ALL_COLLECTION_KEY);
+        try {
+          if (legacy === undefined) {
+            const stored = await collectionStore('readonly', (store) => store.get(ALL_COLLECTION_KEY));
+            collectionMemory ??= stored;
+          } else {
+            collectionMemory ??= expandCollection(legacy);
+            await collectionStore('readwrite', (store) => store.put(collectionMemory, ALL_COLLECTION_KEY));
+            localStorage.removeItem(ALL_COLLECTION_KEY);
+          }
+        } catch (error) {
+          console.warn('[WM Average] IndexedDB indisponible, collection gardée en mémoire', error);
+        }
+      })();
+
       function storageGet(keys) {
         const list = Array.isArray(keys) ? keys : [keys];
         const result = {};
 
         for (const key of list) {
-          const value = readLocalValue(key);
-          if (value !== undefined) {
-            result[key] = value;
-          }
+          // Copie : les appelants modifient l'objet lu avant de le réenregistrer.
+          const value = key === ALL_COLLECTION_KEY ? structuredClone(collectionMemory) : readLocalValue(key);
+          if (value !== undefined) result[key] = value;
         }
 
         return result;
       }
 
+      // Sans copie (~40 ms pour 10 000 cartes) : uniquement pour les lecteurs qui ne modifient rien.
+      function readCollection() {
+        return collectionMemory;
+      }
+
+      // L'objet enregistré devient la copie en mémoire : l'appelant ne doit plus le modifier.
       function storageSet(values) {
         for (const [key, value] of Object.entries(values || {})) {
-          writeLocalValue(key, value);
+          if (key !== ALL_COLLECTION_KEY) {
+            writeLocalValue(key, value);
+            continue;
+          }
+          saveCollection(value)
+            .catch((error) => console.warn('[WM Average] collection non enregistrée', error));
         }
       }
 
@@ -136,7 +271,7 @@
         if (!entry.averages || typeof entry.averages !== 'object' || Array.isArray(entry.averages)) return false;
         const ttl = entry.ok === false
           ? Math.min(5 * 60 * 1000, Math.max(ERROR_CACHE_TTL, Number(entry.retryAfterMs) || 0))
-          : CACHE_TTL;
+          : (Number(entry.ttlMs) > 0 ? Math.min(Number(entry.ttlMs), LONG_CACHE_TTL) : CACHE_TTL);
         const age = now - entry.fetchedAt;
         return age >= 0 && age < ttl;
       }
@@ -158,6 +293,11 @@
               continue;
             }
 
+            if (key.startsWith(MISSING_IMAGE_CACHE_PREFIX)) {
+              if (isMissingImageEntryExpired(readLocalValue(key), now)) keysToRemove.push(key);
+              continue;
+            }
+
             if (!key.startsWith(CACHE_PREFIX)) continue;
 
             const entry = readLocalValue(key);
@@ -173,6 +313,37 @@
         } catch (error) {
           console.debug('[WM Average] nettoyage cache ignoré', error);
         }
+      }
+
+      // Efface uniquement ce qui peut être recalculé : jamais les réglages, les familles ni les statistiques.
+      function clearCaches() {
+        const exactKeys = new Set([
+          ALL_COLLECTION_KEY, BULK_RARITY_LAST_LOAD_KEY, CACHE_CLEANUP_KEY, PRICE_PACE_KEY, PRICE_BLOCK_KEY
+        ]);
+        const doomed = [];
+        let characters = 0;
+
+        for (let index = 0; index < localStorage.length; index += 1) {
+          const key = localStorage.key(index);
+          if (!key) continue;
+
+          if (
+            exactKeys.has(key) ||
+            key.startsWith(CACHE_PREFIX) ||
+            key.startsWith(MISSING_IMAGE_CACHE_PREFIX) ||
+            /^wm_avg_v[123]_/.test(key)
+          ) {
+            doomed.push(key);
+            characters += key.length + (localStorage.getItem(key) || '').length;
+          }
+        }
+
+        doomed.forEach((key) => localStorage.removeItem(key));
+        cacheMemory.clear();
+        saveCollection(undefined).catch((error) => console.warn('[WM Average] collection non effacée', error));
+
+        // localStorage compte 2 octets par caractère.
+        return { removed: doomed.length, kilobytes: Math.round(characters * 2 / 1024) };
       }
 
       function isContextInvalidatedError(error) {
@@ -256,36 +427,43 @@
         }
       }
 
-      function createSponsorNote() {
-        const note = document.createElement('div');
-        note.className = 'wm-sponsor-note';
-        note.append(document.createTextNode('bouton sponsorisé par '));
-
-        const link = document.createElement('a');
-        link.href = 'https://www.twitch.tv/botkz';
-        link.target = '_blank';
-        link.rel = 'noopener noreferrer';
-        link.textContent = 'https://www.twitch.tv/botkz';
-
-        note.append(link);
-        return note;
+      // Fin du chemin seulement : la vignette PNG d'un fichier « x.gif » n'est pas animée,
+      // et une image en data: (pixel transparent de l'extension) n'est pas une illustration.
+      function isGifImage(url) {
+        if (typeof url !== 'string' || !/^https?:/i.test(url)) return false;
+        try {
+          return /\.gif$/i.test(new URL(url).pathname);
+        } catch (_) {
+          return false;
+        }
       }
 
+      // Une carte juste vue sur le Marketplace ou dans une enchère (pas forcément possédée) ne doit
+      // pas écraser la rareté ou l'image d'une carte déjà possédée : une même carte existe en
+      // plusieurs raretés, et "Plus chères" choisit le prix selon la rareté mémorisée.
+      function preserveOwnedMeta(card) {
+        const existing = cardMetaById.get(card.id);
+        const owned = Boolean(existing?.ownedCardId) ||
+          (Array.isArray(existing?.ownedCardIds) && existing.ownedCardIds.length > 0);
+        if (!owned) return { ...card, count: existing?.count || 1 };
+        return { ...card, count: existing.count || 1, rarity: existing.rarity, imageUrl: existing.imageUrl };
+      }
 
       return {
-        CACHE_TTL, ERROR_CACHE_TTL, MAX_CONCURRENT, BULK_RARITY_LAST_LOAD_KEY,
+        CACHE_TTL, LONG_CACHE_TTL, ERROR_CACHE_TTL, MAX_CONCURRENT, BULK_RARITY_LAST_LOAD_KEY,
         ALL_COLLECTION_KEY, PULL_RECAP_ENABLED_KEY, PULL_STATS_KEY,
         AUTO_OPEN_ENABLED_KEY, AUTO_OPEN_NEXT_AT_KEY, AUTO_OPEN_SESSION_KEY,
         AUTO_OPEN_MIN_MINUTES_KEY, AUTO_OPEN_MAX_MINUTES_KEY,
         AUTO_OPEN_DEFAULT_MIN_MINUTES, AUTO_OPEN_DEFAULT_MAX_MINUTES,
-        AUTO_OPEN_MIN_DELAY, AUTO_OPEN_MAX_DELAY, COMPACT_MODE_KEY,
+        COMPACT_MODE_KEY,
         MISSING_IMAGE_CACHE_PREFIX, MISSING_IMAGE_FOUND_TTL, MISSING_IMAGE_MISS_TTL,
         RARITIES, DEFAULT_RARE_RARITIES, cardMetaById, idByTitle, cacheMemory,
         isCollectionPage, isMarketplaceDetailPage, isMarketplacePage, isPullsPage,
         isTradesPage, isGlobalCollectionPage, isGuildPage, isLastPullCardVisible, normalizeTitle,
-        cacheKey, readLocalValue, writeLocalValue, storageGet, storageSet,
-        isCacheEntryValid, cleanupPriceCacheOnceDaily, isContextInvalidatedError,
-        reportError, mergeTags, registerCards, createSponsorNote
+        cacheKey, readLocalValue, writeLocalValue, toStoredCard, storageGet, storageSet, collectionReady, readCollection,
+        isCacheEntryValid, cleanupPriceCacheOnceDaily, clearCaches, PRICE_PACE_KEY, PRICE_BLOCK_KEY,
+        isContextInvalidatedError,
+        reportError, mergeTags, registerCards, preserveOwnedMeta, isGifImage
       };
     }
   };

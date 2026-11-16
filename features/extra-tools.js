@@ -26,6 +26,8 @@
 
       function unlockNotificationAudio() {
         if (!isEnabled('notificationSound')) return;
+        // Chrome refuse (et journalise) la création ou la reprise du contexte sans geste utilisateur valide.
+        if (navigator.userActivation && !navigator.userActivation.hasBeenActive) return;
 
         try {
           const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -167,128 +169,6 @@
 
         assetCache.set(absolute, promise);
         return promise;
-      }
-
-      async function inlineCssUrls(value) {
-        const text = String(value || '');
-        const matches = [...text.matchAll(/url\((['"]?)(.*?)\1\)/g)];
-        if (!matches.length) return text;
-
-        let output = text;
-        for (const match of matches) {
-          const dataUrl = await assetAsDataUrl(match[2]);
-          output = output.replace(match[0], `url("${dataUrl.replace(/"/g, '%22')}")`);
-        }
-        return output;
-      }
-
-      async function applyRenderedStyle(source, target, pseudo = null) {
-        const computed = getComputedStyle(source, pseudo);
-
-        for (let index = 0; index < computed.length; index += 1) {
-          const property = computed[index];
-          let value = computed.getPropertyValue(property);
-
-          if (
-            property === 'background-image' ||
-            property === 'mask-image' ||
-            property === '-webkit-mask-image'
-          ) {
-            value = await inlineCssUrls(value);
-          }
-
-          try {
-            target.style.setProperty(property, value, computed.getPropertyPriority(property));
-          } catch (_) {}
-        }
-
-        return computed;
-      }
-
-      function pseudoHasPaint(style) {
-        const borderWidth =
-          (parseFloat(style.borderTopWidth) || 0) +
-          (parseFloat(style.borderRightWidth) || 0) +
-          (parseFloat(style.borderBottomWidth) || 0) +
-          (parseFloat(style.borderLeftWidth) || 0);
-
-        return (
-          (style.content && style.content !== 'none' && style.content !== 'normal') ||
-          (style.backgroundImage && style.backgroundImage !== 'none') ||
-          (style.backgroundColor && style.backgroundColor !== 'rgba(0, 0, 0, 0)' && style.backgroundColor !== 'transparent') ||
-          (style.boxShadow && style.boxShadow !== 'none') ||
-          borderWidth > 0
-        );
-      }
-
-      async function buildPseudo(source, pseudo) {
-        if (!(source instanceof HTMLElement)) return null;
-        if (['IMG', 'INPUT', 'BR', 'HR', 'META', 'LINK'].includes(source.tagName)) return null;
-
-        const style = getComputedStyle(source, pseudo);
-        if (!pseudoHasPaint(style)) return null;
-
-        const node = document.createElement('span');
-        await applyRenderedStyle(source, node, pseudo);
-        node.setAttribute('aria-hidden', 'true');
-
-        const content = style.content;
-        if (
-          content &&
-          content !== 'none' &&
-          content !== 'normal' &&
-          content !== '""' &&
-          content !== "''"
-        ) {
-          node.textContent = content.replace(/^['"]|['"]$/g, '');
-        }
-
-        return node;
-      }
-
-      function isSnapshotControl(element) {
-        return Boolean(
-          element?.matches?.(
-            '.wm-copy-card-button, .wm-wikipedia-card-button, .wm-missing-image-credit, ' +
-            '.wm-average-badge, button, a'
-          )
-        );
-      }
-
-      async function cloneRenderedNode(source) {
-        if (source.nodeType === Node.TEXT_NODE) {
-          return document.createTextNode(source.textContent || '');
-        }
-
-        if (!(source instanceof Element) || isSnapshotControl(source)) {
-          return null;
-        }
-
-        const clone = source.cloneNode(false);
-
-        if (clone instanceof HTMLElement || clone instanceof SVGElement) {
-          await applyRenderedStyle(source, clone);
-        }
-
-        if (source instanceof HTMLImageElement && clone instanceof HTMLImageElement) {
-          clone.removeAttribute('srcset');
-          clone.removeAttribute('sizes');
-          clone.src = await assetAsDataUrl(source.currentSrc || source.src);
-          clone.crossOrigin = 'anonymous';
-        }
-
-        const before = await buildPseudo(source, '::before');
-        if (before) clone.append(before);
-
-        for (const child of source.childNodes) {
-          const childClone = await cloneRenderedNode(child);
-          if (childClone) clone.append(childClone);
-        }
-
-        const after = await buildPseudo(source, '::after');
-        if (after) clone.append(after);
-
-        return clone;
       }
 
       function roundedRectPath(context, x, y, width, height, radius) {

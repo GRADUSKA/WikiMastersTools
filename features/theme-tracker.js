@@ -14,6 +14,7 @@
       const STORAGE_KEY = 'wm_families_v1';
       const CARD_BATCH = 80;
       const SEARCH_MIN_LENGTH = 2;
+      const WHOLE_WORD_MAX_PAGES = 20;
       const MAX_OWNERSHIP_KEYWORDS = 8;
       const MAX_OWNERSHIP_PAGES_PER_KEYWORD = 10;
       const OWNERSHIP_COVERAGE_TARGET = 0.95;
@@ -28,6 +29,7 @@
       let currentFilter = 'all';
       let visibleCount = CARD_BATCH;
       let searchState = createEmptySearchState();
+      let wholeWord = false;
       let marketState = createEmptyMarketState();
 
       function createEmptyMarketState(familyId = null) {
@@ -539,6 +541,28 @@
         };
       }
 
+      function wordsOf(value) {
+        return ` ${normalize(value).replace(/[^a-z0-9]+/g, ' ').trim()} `;
+      }
+
+      function matchesWholeWord(card, query) {
+        const wanted = wordsOf(query);
+        return wanted.trim() !== '' && [card.title, card.category].some((value) => wordsOf(value).includes(wanted));
+      }
+
+      // Le site cherche des sous-chaînes (« tri » trouve « actrice ») : on parcourt ses pages
+      // et on ne garde que les mots entiers du titre ou de la catégorie.
+      async function searchWholeWord(query) {
+        const cards = [];
+        for (let page = 0; page < WHOLE_WORD_MAX_PAGES; page += 1) {
+          const result = await searchGlobalCards(query, page);
+          cards.push(...result.cards.filter((card) => matchesWholeWord(card, query)));
+          if (!result.hasMore) return { cards, truncated: false };
+          await wait(45);
+        }
+        return { cards, truncated: true };
+      }
+
       function familyStats(family) {
         const cards = Array.isArray(family?.cards) ? family.cards : [];
         const owned = cards.filter((card) => card.owned === true).length;
@@ -639,11 +663,11 @@
           const clean = normalize(candidate);
           if (!clean || clean.length < 4 || OWNERSHIP_STOPWORDS.has(clean)) return;
 
-          let set = coverage.get(clean);
-          if (!set) {
-            set = new Set();
-            coverage.set(clean, set);
-          }
+          // Le corpus est fixe : un mot déjà balayé donnerait exactement le même ensemble.
+          if (coverage.has(clean)) return;
+
+          const set = new Set();
+          coverage.set(clean, set);
 
           for (const [id, corpus] of corpusById) {
             if (corpus.includes(clean)) set.add(id);
@@ -726,7 +750,7 @@
 
         for (const value of values) {
           const number = Number(value);
-          if (Number.isFinite(number)) return number;
+          if (Number.isFinite(number) && number > 0) return number;
         }
 
         return null;
@@ -1170,6 +1194,7 @@
         const familyIds = new Set(cards.map((card) => card.id).filter(Boolean));
         const owned = new Map();
         const verifiedIds = new Set();
+        let failedSearches = 0;
 
         report({
           percent: 5,
@@ -1204,8 +1229,14 @@
               }
             }
           } catch (error) {
+            failedSearches += 1;
             console.debug('[WM Average] vérification de possession ignorée', keywords[index], error);
           }
+        }
+
+        // Le site bloque ou ne répond pas : ne pas afficher « Terminé » sur un résultat vide.
+        if (failedSearches === keywords.length) {
+          throw new Error('Vérification impossible, réessaie plus tard.');
         }
 
         const nextCards = cards.map((card) => {
@@ -2054,7 +2085,7 @@
 
         pagination.replaceChildren();
 
-        if (!searchState.query) {
+        if (!searchState.query || searchState.wholeWord || (wholeWord && searchState.loading)) {
           pagination.hidden = true;
           return;
         }
@@ -2130,13 +2161,20 @@
         selected.textContent = `${family.cards.length.toLocaleString('fr-FR')} carte${family.cards.length > 1 ? 's' : ''} dans la famille`;
 
         if (searchState.loading) {
-          status.textContent = `Chargement de la page ${searchState.page + 1}…`;
+          status.textContent = wholeWord
+            ? 'Recherche du mot entier dans les pages du site…'
+            : `Chargement de la page ${searchState.page + 1}…`;
           status.dataset.mode = 'loading';
         } else if (searchState.error) {
           status.textContent = searchState.error;
           status.dataset.mode = 'error';
         } else if (!searchState.query) {
           status.textContent = 'Recherche une carte par son nom, sa catégorie ou sa description.';
+          status.dataset.mode = '';
+        } else if (searchState.wholeWord) {
+          const count = searchState.results.length;
+          status.textContent = `${count.toLocaleString('fr-FR')} résultat${count > 1 ? 's' : ''} en mot entier` +
+            (searchState.truncated ? ` (seulement les ${WHOLE_WORD_MAX_PAGES} premières pages du site, précise la recherche)` : '');
           status.dataset.mode = '';
         } else {
           status.textContent = `Page ${searchState.page + 1} • ${searchState.results.length.toLocaleString('fr-FR')} résultat${searchState.results.length > 1 ? 's' : ''}`;
@@ -2165,7 +2203,7 @@
           if (searchState.query && !searchState.error && !searchState.results.length) {
             const empty = document.createElement('div');
             empty.className = 'wm-family-picker-empty';
-            empty.textContent = 'Aucune carte sur cette page.';
+            empty.textContent = searchState.wholeWord ? 'Aucune carte avec ce mot entier.' : 'Aucune carte sur cette page.';
             results.append(empty);
           }
         }
@@ -2192,8 +2230,8 @@
         const previousHasMore = searchState.hasMore;
         const previousLastPage = searchState.lastPage;
         const previousHighestKnownPage = searchState.highestKnownPage;
-        const page = Math.max(0, Number(targetPage) || 0);
-        const sameQuery = normalize(searchState.query) === normalize(clean);
+        const page = wholeWord ? 0 : Math.max(0, Number(targetPage) || 0);
+        const sameQuery = !wholeWord && !searchState.wholeWord && normalize(searchState.query) === normalize(clean);
 
         searchState = {
           ...searchState,
@@ -2213,6 +2251,22 @@
         renderCardManagerResults(familyIdValue, overlay);
 
         try {
+          if (wholeWord) {
+            const result = await searchWholeWord(clean);
+            if (searchState.requestToken !== token) return;
+
+            searchState = {
+              ...createEmptySearchState(familyIdValue),
+              query: clean,
+              results: result.cards,
+              wholeWord: true,
+              truncated: result.truncated,
+              requestToken: token
+            };
+            renderCardManagerResults(familyIdValue, overlay);
+            return;
+          }
+
           const result = await searchGlobalCards(clean, page);
           if (searchState.requestToken !== token) return;
 
@@ -2226,7 +2280,8 @@
               : page,
             highestKnownPage: Math.max(searchState.highestKnownPage || 0, page + (result.hasMore ? 1 : 0)),
             loading: false,
-            error: ''
+            error: '',
+            wholeWord: false
           };
         } catch (error) {
           if (searchState.requestToken !== token) return;
@@ -2290,7 +2345,19 @@
         submit.className = 'wm-family-primary';
         submit.textContent = 'Rechercher';
 
-        form.append(input, submit);
+        const wordToggle = document.createElement('label');
+        wordToggle.className = 'wm-family-picker-word';
+        wordToggle.title = 'Ne garde que les cartes dont le titre ou la catégorie contient ce mot entier (« tri » ne trouve plus « actrice »).';
+        const wordCheckbox = document.createElement('input');
+        wordCheckbox.type = 'checkbox';
+        wordCheckbox.checked = wholeWord;
+        wordToggle.append(wordCheckbox, document.createTextNode('Mot entier'));
+        wordCheckbox.addEventListener('change', () => {
+          wholeWord = wordCheckbox.checked;
+          if (input.value.trim()) runCardSearch(familyIdValue, overlay, input.value, 0);
+        });
+
+        form.append(input, wordToggle, submit);
 
         const status = document.createElement('div');
         status.className = 'wm-family-picker-status';

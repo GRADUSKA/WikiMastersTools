@@ -4,18 +4,14 @@
   registry.bridgeIntercept = {
     create(runtime) {
       const {
-        originalFetch, emitCollection, isMarketplaceDetailApi, isPacksOpenApi,
-        isTradesApi, isGlobalCardsApi, captureSupabaseRequest, captureGlobalCardsRequest,
+        originalFetch, emitCollection, isMarketplaceDetailApi, isMarketplaceListApi, isPacksOpenApi,
+        isTradesApi, isGlobalCardsApi,
         getGlobalCollectionSummaryCardId, emitGlobalCollectionInspectedCard,
-        emitGlobalCatalogue, emitTrades, fetchTrades,
-        emitMarketplaceDetail, emitPackOpened
+        emitTrades, fetchTrades,
+        emitMarketplaceDetail, emitMarketplaceList, emitPackOpened
       } = runtime.core;
 
       window.fetch = (...args) => {
-        try {
-          captureSupabaseRequest(args[0], args[1] || {});
-          captureGlobalCardsRequest(args[0], args[1] || {});
-        } catch (_) {}
         const input = args[0];
         const url = typeof input === 'string' ? input : input?.url;
         const method = args[1]?.method || input?.method || 'GET';
@@ -29,16 +25,15 @@
             const input = args[0];
             const url = typeof input === 'string' ? input : input?.url;
             if (url && isGlobalCardsApi(url)) {
-              if (response.ok) {
-                response.clone().json().then(emitGlobalCatalogue).catch(() => {});
-                if (getGlobalCollectionSummaryCardId(url)) emitGlobalCollectionInspectedCard(url);
-              }
+              if (getGlobalCollectionSummaryCardId(url)) emitGlobalCollectionInspectedCard(url);
             } else if (url && url.includes('/api/my-collection')) {
               response.clone().json().then(emitCollection).catch(() => {});
             } else if (url && isTradesApi(url)) {
               response.clone().json().then(emitTrades).catch(() => {});
             } else if (url && isMarketplaceDetailApi(url)) {
               response.clone().json().then(emitMarketplaceDetail).catch(() => {});
+            } else if (url && isMarketplaceListApi(url) && method.toUpperCase() === 'GET') {
+              response.clone().json().then(emitMarketplaceList).catch(() => {});
             } else if (url && isPacksOpenApi(url)) {
               response.clone().json().then(emitPackOpened).catch(() => {});
             }
@@ -54,26 +49,13 @@
       if (OriginalXHR) {
         const origOpen = OriginalXHR.prototype.open;
         const origSend = OriginalXHR.prototype.send;
-        const origSetRequestHeader = OriginalXHR.prototype.setRequestHeader;
 
         OriginalXHR.prototype.open = function(method, url, ...rest) {
           this.__wmUrl = typeof url === 'string' ? url : String(url || '');
-          this.__wmHeaders = {};
           return origOpen.call(this, method, url, ...rest);
         };
 
-        OriginalXHR.prototype.setRequestHeader = function(name, value) {
-          try {
-            this.__wmHeaders ||= {};
-            this.__wmHeaders[String(name)] = String(value);
-          } catch (_) {}
-          return origSetRequestHeader.call(this, name, value);
-        };
-
         OriginalXHR.prototype.send = function(...args) {
-          try {
-            captureSupabaseRequest(this.__wmUrl, { headers: this.__wmHeaders || {} });
-          } catch (_) {}
           if (
             this.__wmUrl &&
             (
@@ -81,24 +63,30 @@
               isGlobalCardsApi(this.__wmUrl) ||
               isTradesApi(this.__wmUrl) ||
               isMarketplaceDetailApi(this.__wmUrl) ||
+              isMarketplaceListApi(this.__wmUrl) ||
               isPacksOpenApi(this.__wmUrl)
             )
           ) {
             this.addEventListener('load', () => {
               if (this.status < 200 || this.status >= 300) return;
+
+              if (isGlobalCardsApi(this.__wmUrl)) {
+                if (getGlobalCollectionSummaryCardId(this.__wmUrl)) {
+                  emitGlobalCollectionInspectedCard(this.__wmUrl);
+                }
+                return;
+              }
+
               try {
                 const json = JSON.parse(this.responseText);
-                if (isGlobalCardsApi(this.__wmUrl)) {
-                  emitGlobalCatalogue(json);
-                  if (getGlobalCollectionSummaryCardId(this.__wmUrl)) {
-                    emitGlobalCollectionInspectedCard(this.__wmUrl);
-                  }
-                } else if (this.__wmUrl.includes('/api/my-collection')) {
+                if (this.__wmUrl.includes('/api/my-collection')) {
                   emitCollection(json);
                 } else if (isTradesApi(this.__wmUrl)) {
                   emitTrades(json);
                 } else if (isMarketplaceDetailApi(this.__wmUrl)) {
                   emitMarketplaceDetail(json);
+                } else if (isMarketplaceListApi(this.__wmUrl)) {
+                  emitMarketplaceList(json);
                 } else if (isPacksOpenApi(this.__wmUrl)) {
                   emitPackOpened(json);
                 }

@@ -236,34 +236,40 @@
             'Wikipedia'
           );
 
-          const page = Object.values(json?.query?.pages || {})[0] || null;
-          const imageUrl = page?.thumbnail?.source || null;
-          const fileName = page?.pageimage || null;
-
-          // On ne garde que les images réutilisables hébergées sur Commons.
-          if (imageUrl && /\/wikipedia\/commons\//i.test(String(imageUrl))) {
-            return {
-              found: true,
-              url: imageUrl,
-              source: 'wikimedia',
-              sourceUrl: fileName
-                ? `https://commons.wikimedia.org/wiki/File:${encodeURIComponent(fileName.replace(/ /g, '_'))}`
-                : `https://${language}.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, '_'))}`,
-              creditLabel: 'Wikimedia',
-              fileName
-            };
-          }
+          const entry = wikipediaEntry(language, title, Object.values(json?.query?.pages || {})[0]);
+          if (entry) return entry;
         }
 
         return null;
       }
 
+      // On ne garde que les images réutilisables hébergées sur Commons.
+      function wikipediaEntry(language, title, page) {
+        const imageUrl = page?.thumbnail?.source || null;
+        if (!imageUrl || !/\/wikipedia\/commons\//i.test(String(imageUrl))) return null;
+
+        const fileName = page.pageimage || null;
+        return {
+          found: true,
+          url: imageUrl,
+          source: 'wikimedia',
+          sourceUrl: fileName
+            ? `https://commons.wikimedia.org/wiki/File:${encodeURIComponent(fileName.replace(/ /g, '_'))}`
+            : `https://${language}.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, '_'))}`,
+          creditLabel: 'Wikimedia',
+          fileName
+        };
+      }
+
       async function resolveFresh(title) {
         let candidates = [];
+        // Une source en erreur (refus, réseau) ne prouve pas l'absence d'image : pas de cache.
+        let failed = false;
 
         try {
           candidates = await searchWikidata(title);
         } catch (error) {
+          failed = true;
           console.debug('[WM Average] recherche Wikidata indisponible', title, error);
         }
 
@@ -283,6 +289,7 @@
             const pokemon = await resolvePokemon(title, best);
             if (pokemon) return pokemon;
           } catch (error) {
+            failed = true;
             console.debug('[WM Average] PokéAPI indisponible', title, error);
           }
         }
@@ -298,10 +305,11 @@
           const wikipedia = await resolveWikipedia(title);
           if (wikipedia) return wikipedia;
         } catch (error) {
+          failed = true;
           console.debug('[WM Average] Wikipedia indisponible', title, error);
         }
 
-        return { found: false };
+        return failed ? { found: false, error: true } : { found: false };
       }
 
       async function resolveMissingImage(title) {
@@ -316,6 +324,7 @@
 
         const task = (async () => {
           const result = await resolveFresh(normalized);
+          if (result?.error) return result;
           return save(normalized, result || { found: false });
         })();
 
