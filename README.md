@@ -70,6 +70,7 @@ paquet réel n'est consommé par ces tests.
 
 *Heure de Paris*
 
+- **23/11/2026 — v4.40.0** — « Plus chères » : sous chaque prix, le nombre de ventes sur 30 jours (en orange sous 2 ventes), pour repérer un prix qui repose sur une vente isolée. Nouvelle case « ≥ 2 ventes / 30 j » pour masquer ces cartes. Un prix chargé avant cette version affiche « ventes ? (clic) » : un clic l'actualise avec son nombre de ventes.
 - **23/11/2026 — v4.39.0** — « Plus chères » : nouvelle étiquette « Sans prix » avec toutes les cartes de la collection sans prix, les plus rares d'abord : jamais chargées, ou chargées sans moyenne pour leur rareté (« — ») il y a plus d'un jour. Un clic sur « Voir le prix » d'une ligne charge son prix (une requête par clic), et la ligne se met à jour.
 - **23/11/2026 — v4.38.0** — Les prix remarchent : le site ne donne plus de résumé des ventes. Le prix affiché est maintenant le même que dans l'onglet « Marché » d'une carte : la moyenne de la semaine en cours (ou de la dernière semaine avec des ventes), pour chaque rareté. Mode conforme au règlement du site (pas d'automatisation) :
   - les prix ne se chargent plus tout seuls. Un prix inconnu affiche « Voir le prix » : un clic le charge, une carte à la fois, au plus une requête toutes les 4 s. Un prix déjà chargé reste affiché pour toujours (cliquer dessus l'actualise s'il a plus d'un jour) ;

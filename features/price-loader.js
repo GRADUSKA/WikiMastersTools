@@ -56,6 +56,8 @@
       function isFresh(entry, now = Date.now()) {
         if (!isCacheEntryValid(entry, now)) return false;
         if (entry.ok === false) return true;
+        // Un prix chargé avant le comptage des ventes peut être actualisé d'un clic.
+        if (!entry.sales) return false;
         const ttl = Number(entry.ttlMs) > 0 ? Math.min(Number(entry.ttlMs), LONG_CACHE_TTL) : CACHE_TTL;
         return now - entry.fetchedAt < ttl;
       }
@@ -130,7 +132,8 @@
           averages: detail.ok ? (detail.averages || {}) : {},
           ok: Boolean(detail.ok)
         };
-        if (!detail.ok) entry.retryAfterMs = Number(detail.retryAfterMs) || ERROR_CACHE_TTL;
+        if (detail.ok) entry.sales = detail.sales || {};
+        else entry.retryAfterMs = Number(detail.retryAfterMs) || ERROR_CACHE_TTL;
 
         // Une carte à quelques W ne mérite pas d'être redemandée chaque jour, quelle que soit sa rareté.
         const rarity = cardMetaById.get(id)?.rarity;

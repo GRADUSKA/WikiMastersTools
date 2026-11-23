@@ -10,21 +10,33 @@
         (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) &&
         Number.isFinite(Number(value)) && Number(value) >= 0;
 
+      const RECENT_SALES_MS = 30 * 24 * 60 * 60 * 1000;
+
       // Même prix que l'onglet « Marché » du site : la moyenne de la semaine en cours,
       // ou de la dernière semaine qui a eu des ventes, pour chaque rareté.
-      function averagesFrom(json) {
+      // Le nombre de ventes sur 30 jours dit si ce prix repose sur une vente isolée.
+      function pricesFrom(json) {
         if (!json?.by_rarity || typeof json.by_rarity !== 'object' || Array.isArray(json.by_rarity)) return null;
 
         const averages = {};
+        const sales = {};
+        const since = new Date(Date.now() - RECENT_SALES_MS).toISOString().slice(0, 10);
         for (const [rarity, history] of Object.entries(json.by_rarity)) {
           if (!RARITIES.includes(rarity) || !Array.isArray(history?.weekly)) continue;
-          const last = history.weekly
+          const weeks = history.weekly
             .filter((week) => isPrice(week?.avg) && Number(week?.count) > 0 && typeof week?.start === 'string')
-            .sort((a, b) => a.start.localeCompare(b.start))
-            .at(-1);
-          if (last) averages[rarity] = Number(last.avg);
+            .sort((a, b) => a.start.localeCompare(b.start));
+          const last = weeks.at(-1);
+          if (!last) continue;
+          averages[rarity] = Number(last.avg);
+          sales[rarity] = {
+            recent: weeks
+              .filter((week) => week.start.slice(0, 10) >= since)
+              .reduce((sum, week) => sum + Number(week.count), 0),
+            last: last.start.slice(0, 10)
+          };
         }
-        return averages;
+        return { averages, sales };
       }
 
       function respond(detail) {
@@ -62,10 +74,10 @@
           }
 
           const json = await response.json();
-          const averages = averagesFrom(json);
-          if (!averages) throw new Error('Historique des prix inconnu');
+          const prices = pricesFrom(json);
+          if (!prices) throw new Error('Historique des prix inconnu');
 
-          respond({ requestId, id, ok: true, title: json?.wikipedia_title || null, averages });
+          respond({ requestId, id, ok: true, title: json?.wikipedia_title || null, ...prices });
         } catch (error) {
           respond({ requestId, id, ok: false, retryAfterMs: 60000, error: String(error?.message || error || 'Erreur réseau') });
         } finally {

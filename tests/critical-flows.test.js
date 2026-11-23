@@ -476,6 +476,19 @@ test('le prix est la moyenne de la dernière semaine avec des ventes, comme l’
   assert.equal(h.timers.size,0);
 });
 
+test('le nombre de ventes sur 30 jours accompagne le prix, pour repérer une vente isolée', async () => {
+  const h = salesHarness(async () => response({by_rarity:{
+    C:{weekly:[{start:'2026-07-06',avg:130000,count:1}]},
+    R:{weekly:[{start:'2026-08-31',avg:50,count:9},{start:'2026-09-07',avg:60,count:4},{start:'2026-09-28',avg:70,count:3}]}
+  }}));
+  await flush();
+  assert.equal(JSON.stringify(h.results[0].averages),JSON.stringify({C:130000,R:70}));
+  assert.equal(JSON.stringify(h.results[0].sales),JSON.stringify({
+    C:{recent:0,last:'2026-07-06'},
+    R:{recent:7,last:'2026-09-28'}
+  }));
+});
+
 test('une réponse de format inconnu échoue en une seule requête au lieu de cacher une réponse vide', async () => {
   let calls=0;
   const h = salesHarness(async () => {calls++; return response({});});

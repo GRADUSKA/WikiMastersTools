@@ -17,6 +17,15 @@
       const pendingBridgeRequests = new Map();
       // Cases de prix affichées dans le classement ouvert, redessinées quand un prix arrive.
       const priceCells = new Map();
+      // En dessous, le prix repose sur trop peu de ventes pour classer la carte.
+      const MIN_RECENT_SALES = 2;
+
+      const salesOf = (entry, rarity) => (entry?.ok && rarity && entry.sales?.[rarity]) || null;
+
+      function salesLabel(sales) {
+        const recent = Number(sales.recent) || 0;
+        return recent ? `${recent} vente${recent > 1 ? 's' : ''} / 30 j` : 'aucune vente / 30 j';
+      }
 
       function onPriceUpdated(id) {
         for (const paint of priceCells.get(id) || []) paint();
@@ -189,6 +198,7 @@
             return {
               ...card,
               average,
+              sales: salesOf(entry, card.rarity),
               fetchedAt: Number(entry?.fetchedAt) || 0
             };
           })
@@ -550,10 +560,23 @@
 
         duplicatesFilter.append(duplicatesInput, duplicatesText);
 
+        const salesFilter = document.createElement('label');
+        salesFilter.className = 'wm-ranking-filter-starred';
+        salesFilter.title = 'Masque les cartes dont le prix repose sur moins de 2 ventes en 30 jours. ' +
+          'Les cartes sans nombre de ventes connu restent affichées : clique sur leur prix pour l’actualiser.';
+
+        const salesInput = document.createElement('input');
+        salesInput.type = 'checkbox';
+
+        const salesText = document.createElement('span');
+        salesText.textContent = `≥ ${MIN_RECENT_SALES} ventes / 30 j`;
+
+        salesFilter.append(salesInput, salesText);
+
         const filterCount = document.createElement('span');
         filterCount.className = 'wm-ranking-filter-count';
 
-        filters.append(starredFilter, duplicatesFilter, tagSelect, raritySelect, filterCount);
+        filters.append(starredFilter, duplicatesFilter, salesFilter, tagSelect, raritySelect, filterCount);
 
         const list = document.createElement('div');
         list.className = 'wm-ranking-list';
@@ -655,26 +678,42 @@
             if (entry?.ok) {
               const average = chooseAverage(entry, null, row.rarity || null);
               row.average = average == null ? Number.NaN : average;
+              row.sales = salesOf(entry, row.rarity);
             }
             const pending = runtime.priceLoader.isPending(row.id);
             // Un « — » de moins d'un jour vient du site lui-même (aucune vente) : rien à redemander.
-            const ask = !pending && !runtime.priceLoader.isFresh(entry) &&
-              (!entry?.ok || !Number.isFinite(row.average));
+            const stale = !pending && !runtime.priceLoader.isFresh(entry);
+            const ask = stale && (!entry?.ok || !Number.isFinite(row.average));
 
             price.className = 'wm-ranking-price';
             price.title = ask
               ? 'Charger le prix moyen de la semaine pour cette carte'
-              : (entry?.ok && !Number.isFinite(row.average) ? 'Le site ne connaît aucune vente de cette carte dans cette rareté' : '');
+              : (stale
+                  ? 'Clic pour actualiser le prix et le nombre de ventes'
+                  : (entry?.ok && !Number.isFinite(row.average) ? 'Le site ne connaît aucune vente de cette carte dans cette rareté' : ''));
             price.classList.toggle('wm-ranking-price-ask', ask);
+            price.classList.toggle('wm-ranking-price-stale', stale && !ask);
             price.classList.toggle('wm-ranking-price-empty', !ask && !Number.isFinite(row.average));
             price.textContent = Number.isFinite(row.average)
               ? `${formatAverage(row.average)} W`
               : (pending ? 'Chargement…' : (ask ? 'Voir le prix' : '—'));
+            if (Number.isFinite(row.average) && (row.sales || stale)) {
+              const sales = document.createElement('small');
+              sales.className = 'wm-ranking-sales';
+              if (row.sales) {
+                sales.classList.toggle('wm-ranking-sales-few', (Number(row.sales.recent) || 0) < MIN_RECENT_SALES);
+                sales.textContent = salesLabel(row.sales);
+                sales.title = `Prix calculé sur la semaine du ${new Date(row.sales.last).toLocaleDateString('fr-FR')}`;
+              } else {
+                sales.textContent = 'ventes ? (clic)';
+              }
+              price.append(sales);
+            }
             if (row.sellButton) refreshSaleButton(row.sellButton);
           };
           // Un clic : une requête pour cette carte seulement, au rythme du chargeur de prix.
           price.addEventListener('click', () => {
-            if (price.classList.contains('wm-ranking-price-ask')) {
+            if (price.classList.contains('wm-ranking-price-ask') || price.classList.contains('wm-ranking-price-stale')) {
               runtime.priceLoader.loadCacheForCards([row], { manual: true });
             }
           });
@@ -790,7 +829,7 @@
               ? chooseAverage(entry, null, card.rarity || null)
               : Number.NaN;
 
-            return { row: { ...card, average }, index: null };
+            return { row: { ...card, average, sales: salesOf(entry, card.rarity) }, index: null };
           }).sort(byPriceThenTitle);
         };
 
@@ -825,7 +864,9 @@
           const tag = key && !isLocalFilter(key) ? knownTags.get(key) : null;
           const rarity = raritySelect.value;
           const duplicatesOnly = duplicatesInput.checked;
-          const filterActive = starredOnly || untaggedOnly || gifOnly || unpricedOnly || Boolean(tag) || Boolean(rarity) || duplicatesOnly;
+          const regularSalesOnly = salesInput.checked;
+          const filterActive = starredOnly || untaggedOnly || gifOnly || unpricedOnly || Boolean(tag) || Boolean(rarity) ||
+            duplicatesOnly || regularSalesOnly;
 
           let pool = filterActive ? filterableRows : rankedRows;
           let result = null;
@@ -864,7 +905,8 @@
             (!untaggedOnly || rowTags(row).length === 0) &&
             (!gifOnly || isGifCard(row)) &&
             (!rarity || row.rarity === rarity) &&
-            (!duplicatesOnly || (Number(row.count) || 1) > 1)
+            (!duplicatesOnly || (Number(row.count) || 1) > 1) &&
+            (!regularSalesOnly || !row.sales || (Number(row.sales.recent) || 0) >= MIN_RECENT_SALES)
           ));
 
           const unpricedCount = visibleRows
@@ -897,6 +939,7 @@
         tagSelect.addEventListener('change', applyFilters);
         raritySelect.addEventListener('change', applyFilters);
         duplicatesInput.addEventListener('change', applyFilters);
+        salesInput.addEventListener('change', applyFilters);
 
         const observer = new IntersectionObserver((entries) => {
           if (entries.some((entry) => entry.isIntersecting)) {
