@@ -530,6 +530,7 @@
 
         runtime.packs?.onPriceUpdated(id);
         runtime.myBids?.onPriceUpdated(id);
+        runtime.ranking?.onPriceUpdated(id);
         runtime.trades?.renderTradeDetailCard(id);
 
         if (id === globalCollectionCardId) {

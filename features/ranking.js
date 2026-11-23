@@ -15,6 +15,12 @@
       const { formatAverage, chooseAverage } = runtime.priceUi;
       const pendingMarketplaceListings = new Map();
       const pendingBridgeRequests = new Map();
+      // Cases de prix affichées dans le classement ouvert, redessinées quand un prix arrive.
+      const priceCells = new Map();
+
+      function onPriceUpdated(id) {
+        for (const paint of priceCells.get(id) || []) paint();
+      }
 
       // Requête au bridge résolue par l'événement de réponse portant le même requestId.
       function requestBridge(eventName, detail = {}, timeoutMs = 12000) {
@@ -163,7 +169,7 @@
         if (!candidates.length) {
           runtime.modalUi.showInfoModal(
             'Aucun prix chargé',
-            'Aucune carte avec métadonnées n’est encore disponible. Parcourez votre collection ou utilisez « Charger les prix », puis réessayez.'
+            'Aucune carte de ta collection n’est encore connue. Parcours ta collection, puis réessaie.'
           );
           return;
         }
@@ -194,14 +200,6 @@
             return a.title.localeCompare(b.title, 'fr');
           });
 
-        if (!rows.length) {
-          runtime.modalUi.showInfoModal(
-            'Aucun prix chargé',
-            'Aucun prix n’est encore présent dans le cache. Parcourez votre collection ou utilisez « Charger les prix », puis réessayez.'
-          );
-          return;
-        }
-
         // Cartes connues sans prix en cache : hors classement, mais utiles aux filtres
         // favoris / étiquettes pour ne pas donner un résultat incomplet.
         const rankedIds = new Set(rows.map((row) => row.id));
@@ -213,6 +211,11 @@
           .map((card) => ({ ...card, average: Number.NaN, fetchedAt: 0 }))
           .sort((a, b) => a.title.localeCompare(b.title, 'fr'));
 
+        // Toutes les cartes jamais chargées, pour l'étiquette « Sans prix ».
+        const allUnpricedRows = candidates
+          .filter((card) => !rankedIds.has(card.id))
+          .map((card) => ({ ...card, average: Number.NaN, fetchedAt: 0 }));
+
         const isComplete =
           collectionEntry?.complete === true &&
           rows.length >= candidates.length;
@@ -223,6 +226,7 @@
           {
             incomplete: !isComplete,
             unpricedRows,
+            allUnpricedRows,
             knownCards: candidates.length,
             cachedCards: rows.length
           }
@@ -460,7 +464,15 @@
         const UNTAGGED_KEY = '__untagged__';
         // Pseudo-étiquette calculée par l'extension : rien n'est écrit sur le compte du joueur.
         const GIF_KEY = '__gif__';
-        const isLocalFilter = (key) => key === UNTAGGED_KEY || key === GIF_KEY;
+        const UNPRICED_KEY = '__unpriced__';
+        const isLocalFilter = (key) => key === UNTAGGED_KEY || key === GIF_KEY || key === UNPRICED_KEY;
+        // Sans prix : jamais chargées, ou chargées sans moyenne pour leur rareté (« — »). Plus rares d'abord.
+        const allUnpricedRows = [
+          ...rankedRows.filter(({ row }) => !Number.isFinite(row.average)),
+          ...(Array.isArray(status.allUnpricedRows) ? status.allUnpricedRows : []).map((row) => ({ row, index: null }))
+        ].sort((a, b) => (
+          RARITIES.indexOf(a.row.rarity) - RARITIES.indexOf(b.row.rarity) || a.row.title.localeCompare(b.row.title, 'fr')
+        ));
 
         const filters = document.createElement('div');
         filters.className = 'wm-ranking-filters';
@@ -493,6 +505,10 @@
         gifOption.value = GIF_KEY;
         gifOption.textContent = `GIFs (${gifCount})`;
 
+        const unpricedOption = document.createElement('option');
+        unpricedOption.value = UNPRICED_KEY;
+        unpricedOption.textContent = `Sans prix (${allUnpricedRows.length})`;
+
         const fillTagOptions = () => {
           const selected = tagSelect.value;
           const options = [...knownTags.values()]
@@ -506,7 +522,7 @@
               return option;
             });
 
-          tagSelect.replaceChildren(allTagsOption, untaggedOption, gifOption, ...options);
+          tagSelect.replaceChildren(allTagsOption, untaggedOption, gifOption, unpricedOption, ...options);
           tagSelect.value = knownTags.has(selected) || isLocalFilter(selected) ? selected : '';
         };
 
@@ -634,13 +650,38 @@
           info.append(name, meta);
 
           const price = document.createElement('div');
-          price.className = 'wm-ranking-price';
-          if (Number.isFinite(row.average)) {
-            price.textContent = `${formatAverage(row.average)} W`;
-          } else {
-            price.textContent = '—';
-            price.classList.add('wm-ranking-price-empty');
-          }
+          const paintPrice = () => {
+            const entry = cacheMemory.get(row.id) || storageGet([cacheKey(row.id)])[cacheKey(row.id)];
+            if (entry?.ok) {
+              const average = chooseAverage(entry, null, row.rarity || null);
+              row.average = average == null ? Number.NaN : average;
+            }
+            const pending = runtime.priceLoader.isPending(row.id);
+            // Un « — » de moins d'un jour vient du site lui-même (aucune vente) : rien à redemander.
+            const ask = !pending && !runtime.priceLoader.isFresh(entry) &&
+              (!entry?.ok || !Number.isFinite(row.average));
+
+            price.className = 'wm-ranking-price';
+            price.title = ask
+              ? 'Charger le prix moyen de la semaine pour cette carte'
+              : (entry?.ok && !Number.isFinite(row.average) ? 'Le site ne connaît aucune vente de cette carte dans cette rareté' : '');
+            price.classList.toggle('wm-ranking-price-ask', ask);
+            price.classList.toggle('wm-ranking-price-empty', !ask && !Number.isFinite(row.average));
+            price.textContent = Number.isFinite(row.average)
+              ? `${formatAverage(row.average)} W`
+              : (pending ? 'Chargement…' : (ask ? 'Voir le prix' : '—'));
+            if (row.sellButton) refreshSaleButton(row.sellButton);
+          };
+          // Un clic : une requête pour cette carte seulement, au rythme du chargeur de prix.
+          price.addEventListener('click', () => {
+            if (price.classList.contains('wm-ranking-price-ask')) {
+              runtime.priceLoader.loadCacheForCards([row], { manual: true });
+            }
+          });
+          const paints = priceCells.get(row.id) || new Set();
+          paints.add(paintPrice);
+          priceCells.set(row.id, paints);
+          paintPrice();
 
           const sellButton = document.createElement('button');
           sellButton.type = 'button';
@@ -780,15 +821,18 @@
           const key = tagSelect.value;
           const untaggedOnly = key === UNTAGGED_KEY;
           const gifOnly = key === GIF_KEY;
+          const unpricedOnly = key === UNPRICED_KEY;
           const tag = key && !isLocalFilter(key) ? knownTags.get(key) : null;
           const rarity = raritySelect.value;
           const duplicatesOnly = duplicatesInput.checked;
-          const filterActive = starredOnly || untaggedOnly || gifOnly || Boolean(tag) || Boolean(rarity) || duplicatesOnly;
+          const filterActive = starredOnly || untaggedOnly || gifOnly || unpricedOnly || Boolean(tag) || Boolean(rarity) || duplicatesOnly;
 
           let pool = filterActive ? filterableRows : rankedRows;
           let result = null;
 
-          if (tag) {
+          if (unpricedOnly) {
+            pool = allUnpricedRows;
+          } else if (tag) {
             if (tag.id) loadFetchedRows(key, 'wm-average-load-tag-cards', { tagId: tag.id });
             result = fetchedResults.get(key) || null;
 
@@ -832,6 +876,7 @@
             : '';
 
           renderedCount = 0;
+          priceCells.clear();
           list.replaceChildren();
           list.scrollTop = 0;
 
@@ -872,6 +917,7 @@
 
         const close = () => {
           closed = true;
+          priceCells.clear();
           observer.disconnect();
           overlay.remove();
         };
@@ -1065,7 +1111,7 @@
       });
 
 
-      return { openRankingModal };
+      return { openRankingModal, onPriceUpdated };
     }
   };
 })();

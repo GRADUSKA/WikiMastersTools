@@ -492,6 +492,12 @@
   color: #64748b;
 }
 
+.wm-ranking-price-ask {
+  color: #c4b5fd;
+  cursor: pointer;
+  text-decoration: underline dashed;
+}
+
 @media (max-width: 520px) {
   .wm-ranking-row {
     grid-template-columns: 28px 36px minmax(0, 1fr) auto;
