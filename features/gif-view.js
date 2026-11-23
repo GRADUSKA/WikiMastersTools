@@ -28,6 +28,65 @@
           ));
       }
 
+      const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+      async function waitFor(find, timeoutMs) {
+        const end = Date.now() + timeoutMs;
+        while (Date.now() < end) {
+          const found = find();
+          if (found) return found;
+          await wait(200);
+        }
+        return null;
+      }
+
+      const siteSearchInput = () => [...document.querySelectorAll('input')]
+        .find((input) => /Rechercher/.test(input.placeholder || '') && !input.closest('.wm-modal-overlay'));
+
+      const siteCard = (id) => [...document.querySelectorAll(`[data-wm-card-id="${CSS.escape(id)}"]`)]
+        .find((node) => !node.closest('.wm-modal-overlay'));
+
+      // Le champ est contrôlé par React : il faut passer par le setter natif pour qu'il voie la saisie.
+      function setSiteSearch(input, value) {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, value);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+
+      // Étiquettes, favori, enchères : tout passe par la fiche du site. On cherche la carte
+      // comme si on tapait son titre, on ouvre sa fiche, puis on revient à la liste des GIF.
+      // ponytail: seule la 1re page de résultats est regardée, un titre très courant peut échouer.
+      async function openSiteCard(card, overlay, search) {
+        const input = siteSearchInput();
+        if (!input) return;
+        if (!siteCard(card.id) && card.title.trim().length < 3) {
+          runtime.modalUi.showInfoModal(
+            'Recherche impossible',
+            `La recherche du site demande au moins 3 caractères : cherche « ${card.title} » à la main dans ta collection.`
+          );
+          return;
+        }
+
+        overlay.style.display = 'none';
+        try {
+          if (!siteCard(card.id)) {
+            search.previous ??= input.value;
+            setSiteSearch(input, card.title);
+          }
+
+          const target = await waitFor(() => siteCard(card.id), 8000);
+          if (!target) {
+            runtime.modalUi.showInfoModal('Carte introuvable', `« ${card.title} » n’apparaît pas dans la recherche du site.`);
+            return;
+          }
+
+          target.click();
+          const sheet = await waitFor(() => document.querySelector('body > .sheet-overlay'), 3000);
+          if (sheet) await waitFor(() => !sheet.isConnected, 60 * 60 * 1000);
+        } finally {
+          overlay.style.display = '';
+        }
+      }
+
       async function openGifView() {
         if (document.querySelector('.wm-gif-overlay')) return;
         await collectionReady;
@@ -48,7 +107,8 @@
         const heading = el('div');
         heading.append(
           el('h2', null, 'Cartes GIF'),
-          el('p', null, `${cards.length} carte${cards.length > 1 ? 's' : ''} dont l’illustration du site est un GIF`)
+          el('p', null, `${cards.length} carte${cards.length > 1 ? 's' : ''} dont l’illustration du site est un GIF • ` +
+            'clique sur une carte pour ouvrir sa fiche (étiquettes, favori…)')
         );
 
         const closeButton = el('button', 'wm-ranking-close', '×');
@@ -71,7 +131,18 @@
         overlay.append(modal);
         document.body.append(overlay);
 
-        const close = () => overlay.remove();
+        const search = { previous: null };
+        grid.addEventListener('click', (event) => {
+          const element = event.target.closest('[data-wm-card-id]');
+          const card = element && cards.find(({ id }) => id === element.dataset.wmCardId);
+          if (card) openSiteCard(card, overlay, search).catch((error) => reportError('GIFs', error));
+        });
+
+        const close = () => {
+          overlay.remove();
+          const input = siteSearchInput();
+          if (search.previous != null && input) setSiteSearch(input, search.previous);
+        };
         closeButton.addEventListener('click', close);
         overlay.addEventListener('click', (event) => {
           if (event.target === overlay) close();
