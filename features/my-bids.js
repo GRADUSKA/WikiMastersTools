@@ -9,17 +9,10 @@
       const SETTING_KEY = 'myBids';
 
       const SOUND_KEY = 'wm_my_bids_sound_v1';
-      // Le site tolère ~30 requêtes par minute pour tout l'onglet : un rafraîchissement toutes les 7 s
-      // en prenait un tiers au chargement des prix. Rythme rapide seulement quand une enchère va finir.
-      const POLL_VISIBLE_MS = 15000;
-      const POLL_URGENT_MS = 7000;
-      const POLL_HIDDEN_MS = 20000;
-      const URGENT_WINDOW_MS = 2 * 60 * 1000;
       const BALANCE_REFRESH_MS = 60 * 1000;
       const FETCH_TIMEOUT_MS = 10000;
-      const POLL_MAX_MS = 60000;
-      // Blocage vu ici : le chargement des prix (même clé) fait une courte pause lui aussi.
-      const SITE_BLOCK_MS = 15000;
+      // Blocage vu ici : le chargement des prix (même clé) se met en pause lui aussi.
+      const SITE_BLOCK_MS = 10 * 60 * 1000;
 
       const { readLocalValue, writeLocalValue, PRICE_BLOCK_KEY } = runtime.core;
       const logic = runtime.myBidsLogic;
@@ -85,10 +78,8 @@
       let loading = false;
       let refreshQueued = false;
       let bidGeneration = 0;
-      let pollTimer = null;
       let tickTimer = null;
       let balanceAt = 0;
-      let errorStreak = 0;
       let audioContext = null;
 
       function el(tag, className, text) {
@@ -225,8 +216,8 @@
           throw new Error('Session expirée, reconnecte-toi à WikiMasters.');
         }
         if (response.status === 403 || response.status === 429) {
-          writeLocalValue(PRICE_BLOCK_KEY, Math.max(siteBlockedUntil(), Date.now() + SITE_BLOCK_MS));
-          throw new Error(`Le site limite les requêtes (HTTP ${response.status}), nouvelle tentative plus tard.`);
+          writeLocalValue(PRICE_BLOCK_KEY, Math.max(Number(readLocalValue(PRICE_BLOCK_KEY)) || 0, Date.now() + SITE_BLOCK_MS));
+          throw new Error(`Le site limite les requêtes (HTTP ${response.status}) : réessaie dans quelques minutes.`);
         }
         if (!response.ok) throw new Error(`Actualisation impossible (HTTP ${response.status}).`);
 
@@ -274,7 +265,6 @@
             if (!ids.has(id)) state.ownBids.delete(id);
           }
           state.error = null;
-          errorStreak = 0;
           state.loaded = true;
           state.updatedAt = Date.now();
           checkAlerts();
@@ -283,7 +273,6 @@
           if (Date.now() - balanceAt > BALANCE_REFRESH_MS) refreshBalance();
         } catch (error) {
           state.error = String(error?.message || error);
-          errorStreak += 1;
         } finally {
           loading = false;
           try {
@@ -411,7 +400,12 @@
           updateSoundButton();
         });
 
-        controls.append(balance, sound);
+        // Pas de rafraîchissement en boucle (automatisation interdite par le site) : à la demande.
+        const reload = el('button', 'wm-bids-sound', 'Actualiser');
+        reload.type = 'button';
+        reload.addEventListener('click', () => refresh());
+
+        controls.append(balance, reload, sound);
         header.append(titleWrap, controls);
         return header;
       }
@@ -566,41 +560,8 @@
         updateSoundButton();
       }
 
-      function siteBlockedUntil() {
-        return Number(readLocalValue(PRICE_BLOCK_KEY)) || 0;
-      }
-
-      function hasUrgentBid() {
-        const now = Date.now();
-        return state.bids.some((bid) => {
-          const remaining = logic.remainingMs(bid, now);
-          return remaining > 0 && remaining < URGENT_WINDOW_MS;
-        });
-      }
-
-      function schedulePoll() {
-        clearTimeout(pollTimer);
-        if (!running) return;
-
-        // Après des erreurs, on espace les requêtes au lieu de marteler un site qui bloque,
-        // et on attend la fin d'un blocage vu par le chargement des prix.
-        const base = hasUrgentBid() ? POLL_URGENT_MS : (document.hidden ? POLL_HIDDEN_MS : POLL_VISIBLE_MS);
-        const backoff = Math.min(POLL_MAX_MS, base * 2 ** Math.min(errorStreak, 3));
-        const blocked = Math.min(POLL_MAX_MS, Math.max(0, siteBlockedUntil() - Date.now()));
-
-        pollTimer = setTimeout(async () => {
-          try {
-            await refresh();
-          } finally {
-            schedulePoll();
-          }
-        }, Math.max(backoff, blocked));
-      }
-
       function onVisibilityChange() {
-        if (!running) return;
-        if (!document.hidden) refresh();
-        schedulePoll();
+        if (running && !document.hidden) refresh();
       }
 
       function start() {
@@ -614,7 +575,6 @@
 
         tickTimer = setInterval(tick, 1000);
         refresh();
-        schedulePoll();
       }
 
       function stop() {
@@ -629,7 +589,6 @@
         state.rowErrors.clear();
         state.minHints.clear();
 
-        clearTimeout(pollTimer);
         clearInterval(tickTimer);
         document.removeEventListener('visibilitychange', onVisibilityChange);
         for (const type of ['pointerdown', 'pointerup', 'touchend', 'click', 'keydown']) {

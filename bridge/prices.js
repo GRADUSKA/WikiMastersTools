@@ -4,103 +4,74 @@
   registry.bridgePrices = {
     create(runtime) {
       const { originalFetch } = runtime.core;
+      const RARITIES = ['L', 'UR', 'SR', 'R', 'PC', 'C'];
 
+      const isPrice = (value) =>
+        (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) &&
+        Number.isFinite(Number(value)) && Number(value) >= 0;
+
+      // Même prix que l'onglet « Marché » du site : la moyenne de la semaine en cours,
+      // ou de la dernière semaine qui a eu des ventes, pour chaque rareté.
+      function averagesFrom(json) {
+        if (!json?.by_rarity || typeof json.by_rarity !== 'object' || Array.isArray(json.by_rarity)) return null;
+
+        const averages = {};
+        for (const [rarity, history] of Object.entries(json.by_rarity)) {
+          if (!RARITIES.includes(rarity) || !Array.isArray(history?.weekly)) continue;
+          const last = history.weekly
+            .filter((week) => isPrice(week?.avg) && Number(week?.count) > 0 && typeof week?.start === 'string')
+            .sort((a, b) => a.start.localeCompare(b.start))
+            .at(-1);
+          if (last) averages[rarity] = Number(last.avg);
+        }
+        return averages;
+      }
+
+      function respond(detail) {
+        window.dispatchEvent(new CustomEvent('wm-average-response', { detail }));
+      }
+
+      // Une seule requête par demande, sans nouvel essai automatique : c'est la personne qui reclique.
       window.addEventListener('wm-average-request', async (event) => {
         const { id, requestId } = event.detail || {};
         if (!id || !requestId) return;
 
-        let lastError = null;
-        let lastRetryAfterMs = 60000;
-        // Attente demandée par le serveur (en-tête Retry-After), 0 s'il n'en donne pas.
-        let retryAfterHintMs = 0;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 25000);
 
-        for (let attempt = 1; attempt <= 3; attempt += 1) {
-          const controller = new AbortController();
-          // Le site met parfois plus de 10 s à répondre : abandonner trop tôt ne fait que le surcharger.
-          const timeout = setTimeout(() => controller.abort(), 25000);
-          try {
-            const response = await originalFetch(
-              `/api/marketplace/cards/${encodeURIComponent(id)}/sales?scope=summary`,
-              {
-                signal: controller.signal,
-                method: 'GET',
-                credentials: 'include',
-                headers: { accept: '*/*' }
-              }
-            );
+        try {
+          const response = await originalFetch(
+            `/api/marketplace/cards/${encodeURIComponent(id)}/price-history`,
+            { signal: controller.signal, method: 'GET', credentials: 'include', headers: { accept: '*/*' } }
+          );
 
-            if (!response.ok) {
-              const retryable = response.status === 429 || response.status >= 500;
-              const header = response.headers.get('Retry-After');
-              const seconds = Number(header);
-              const delay = header == null ? 0 : (Number.isFinite(seconds) ? seconds * 1000 : Date.parse(header) - Date.now());
-              lastRetryAfterMs = Math.max(60000, Math.min(300000, delay || 0));
-              retryAfterHintMs = Math.max(0, Math.min(300000, delay || 0));
-              lastError = new Error(`HTTP ${response.status}`);
-
-              if (!retryable || attempt >= 3) {
-                throw lastError;
-              }
-            } else {
-              const json = await response.json();
-              if (!json?.summary || typeof json.summary !== 'object' || Array.isArray(json.summary)) {
-                throw new Error('Résumé des ventes invalide');
-              }
-              const averages = {};
-
-              if (json?.summary && typeof json.summary === 'object') {
-                for (const [rarity, value] of Object.entries(json.summary)) {
-                  if (value && ['L', 'UR', 'SR', 'R', 'PC', 'C'].includes(rarity) &&
-                      (typeof value.average === 'number' || (typeof value.average === 'string' && value.average.trim() !== '')) &&
-                      Number.isFinite(Number(value.average)) && Number(value.average) >= 0) {
-                    averages[rarity] = Number(value.average);
-                  }
-                }
-              }
-
-              window.dispatchEvent(new CustomEvent('wm-average-response', {
-                detail: {
-                  requestId,
-                  id,
-                  ok: true,
-                  title: json?.wikipedia_title || null,
-                  averages
-                }
-              }));
-              return;
-            }
-          } catch (error) {
-            lastError = error;
-
-            const statusMatch = String(error?.message || '').match(/HTTP\s+(\d+)/);
-            const status = statusMatch ? Number(statusMatch[1]) : null;
-            const retryable = status == null || (status >= 500 && status <= 599);
-
-            if (!retryable || attempt >= 3) {
-              break;
-            }
-          } finally {
-            clearTimeout(timeout);
+          if (!response.ok) {
+            const header = response.headers.get('Retry-After');
+            const seconds = Number(header);
+            const delay = header == null ? 0 : (Number.isFinite(seconds) ? seconds * 1000 : Date.parse(header) - Date.now());
+            respond({
+              requestId,
+              id,
+              ok: false,
+              retryAfterMs: Math.max(60000, Math.min(300000, delay || 0)),
+              retryAfterHintMs: Math.max(0, Math.min(300000, delay || 0)),
+              rateLimited: response.status === 403 || response.status === 429,
+              error: `HTTP ${response.status}`
+            });
+            return;
           }
 
-          // Une limitation du serveur est mise en cache, sans rafale de nouvelles requêtes.
-          if (String(lastError?.message).includes('HTTP 429')) break;
-          await new Promise((resolve) => setTimeout(resolve, 300 * attempt));
+          const json = await response.json();
+          const averages = averagesFrom(json);
+          if (!averages) throw new Error('Historique des prix inconnu');
+
+          respond({ requestId, id, ok: true, title: json?.wikipedia_title || null, averages });
+        } catch (error) {
+          respond({ requestId, id, ok: false, retryAfterMs: 60000, error: String(error?.message || error || 'Erreur réseau') });
+        } finally {
+          clearTimeout(timeout);
         }
-
-        window.dispatchEvent(new CustomEvent('wm-average-response', {
-          detail: {
-            requestId,
-            id,
-            ok: false,
-            retryAfterMs: lastRetryAfterMs,
-            retryAfterHintMs,
-            rateLimited: /HTTP (429|403)/.test(String(lastError?.message)),
-            error: String(lastError?.message || lastError || 'Erreur réseau')
-          }
-        }));
       });
-
 
       return {};
     }

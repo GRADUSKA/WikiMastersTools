@@ -9,7 +9,8 @@
       } = runtime.core;
 
       // Pause entre deux pages : ~120 requêtes d'affilée déclenchent le 403 du site.
-      const PAGE_DELAY_MS = 250;
+      // Au rythme d'une personne qui fait défiler sa collection, pas plus vite.
+      const PAGE_DELAY_MS = 1500;
 
       // Taille de page renvoyée par le serveur, avant que extractCards n'écarte
       // les entrées sans titre. Sinon une seule carte sans titre fausse tout le calcul.

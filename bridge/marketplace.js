@@ -72,7 +72,7 @@
         let totalPages = 1;
 
         while (page < Math.min(totalPages, MAX_COLLECTION_PAGES)) {
-          if (page > 0) await sleep(250);
+          if (page > 0) await sleep(1500);
 
           let json;
           try {
@@ -337,38 +337,12 @@
 
           if (needsStarredConfirmation()) return;
 
-          let { response, json } = await submitMarketplaceListing(
+          // Une seule annonce par clic : après une erreur, c'est à la personne de recliquer.
+          const { response, json } = await submitMarketplaceListing(
             resolvedOwnedCardId,
             amount,
             duration
           );
-
-          if (!response.ok && isOwnershipListingError(json)) {
-            staleOwnedCardId = resolvedOwnedCardId;
-
-            window.dispatchEvent(new CustomEvent('wm-average-create-listing-progress', {
-              detail: {
-                requestId,
-                state: 'refreshing-id',
-                staleOwnedCardId
-              }
-            }));
-
-            resolvedOwnedCardId = await resolveAvailableOwnedCardId(
-              catalogueCardId,
-              title,
-              new Set([staleOwnedCardId]),
-              true
-            );
-
-            if (needsStarredConfirmation()) return;
-
-            ({ response, json } = await submitMarketplaceListing(
-              resolvedOwnedCardId,
-              amount,
-              duration
-            ));
-          }
 
           if (!response.ok) {
             const ownershipError = isOwnershipListingError(json);

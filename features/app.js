@@ -35,7 +35,6 @@
         }
 
         if (isTradesPage()) {
-          runtime.trades.ensureTradesLoaded();
           runtime.trades.renderTradeButtons();
           runtime.trades.renderTradePreviews();
           runtime.trades.renderTradeDetailCards();
@@ -75,7 +74,6 @@
         if (currentPath === previousPath) return false;
 
         previousPath = currentPath;
-        if (isTradesPage()) runtime.trades.resetTradesRequest();
         if (!runtime.compactMode.compactEligiblePage()) {
           document.body?.classList.remove('wm-compact-mode');
         }

@@ -266,14 +266,14 @@
         }
       }
 
+      // Un prix obtenu reste affiché quel que soit son âge : il n'est plus redemandé automatiquement.
       function isCacheEntryValid(entry, now = Date.now()) {
         if (!entry || typeof entry.ok !== 'boolean' || !Number.isFinite(entry.fetchedAt)) return false;
         if (!entry.averages || typeof entry.averages !== 'object' || Array.isArray(entry.averages)) return false;
-        const ttl = entry.ok === false
-          ? Math.min(5 * 60 * 1000, Math.max(ERROR_CACHE_TTL, Number(entry.retryAfterMs) || 0))
-          : (Number(entry.ttlMs) > 0 ? Math.min(Number(entry.ttlMs), LONG_CACHE_TTL) : CACHE_TTL);
         const age = now - entry.fetchedAt;
-        return age >= 0 && age < ttl;
+        if (age < 0) return false;
+        if (entry.ok) return true;
+        return age < Math.min(5 * 60 * 1000, Math.max(ERROR_CACHE_TTL, Number(entry.retryAfterMs) || 0));
       }
 
       function cleanupPriceCacheOnceDaily() {
@@ -303,7 +303,7 @@
             const entry = readLocalValue(key);
             const fetchedAt = Number(entry?.fetchedAt) || 0;
 
-            if (!fetchedAt || now - fetchedAt > CACHE_MAX_AGE) {
+            if (!fetchedAt || (entry?.ok !== true && now - fetchedAt > CACHE_MAX_AGE)) {
               keysToRemove.push(key);
             }
           }

@@ -18,7 +18,6 @@
         marketplaceDeals: true,
         gifView: true,
         globalCollectionPrice: true,
-        bulkPriceLoader: true,
         ranking: true,
         rankingSales: true,
         themeTracker: true,
@@ -26,8 +25,6 @@
         compactMode: true,
         packRecap: true,
         pullStats: true,
-        openAll: true,
-        autoOpen: true,
         tradeValues: true,
         tradePreviews: true,
         notificationSound: true
@@ -49,11 +46,10 @@
           title: 'Prix & collection',
           description: 'Prix moyens, outils de collection et classement.',
           items: [
-            ['collectionPrices', 'Prix moyens dans la collection', 'Affiche les badges de prix moyen directement sur les cartes de la collection.'],
+            ['collectionPrices', 'Prix moyens dans la collection', 'Affiche les badges de prix moyen sur les cartes de la collection. Un prix inconnu se charge en cliquant sur « Voir le prix ».'],
             ['marketplacePrice', 'Prix moyen sur Marketplace', 'Affiche le prix moyen sur la fiche d’une annonce Marketplace.'],
-            ['marketplaceDeals', 'Bonnes affaires sur Marketplace', 'Affiche la moyenne et l’écart de prix sur chaque annonce de la liste. Charge au plus 20 prix L, UR ou SR manquants par page.'],
+            ['marketplaceDeals', 'Bonnes affaires sur Marketplace', 'Affiche la moyenne et l’écart de prix sur chaque annonce de la liste dont le prix est déjà connu.'],
             ['globalCollectionPrice', 'Prix dans la collection globale', 'Affiche le prix moyen quand une carte est inspectée dans la collection globale.'],
-            ['bulkPriceLoader', 'Chargement massif des prix', 'Ajoute « Charger les prix » avec sélection des raretés.'],
             ['ranking', 'Classement « Plus chères »', 'Ajoute le classement des cartes connues par prix moyen.'],
             ['rankingSales', 'Mise en vente depuis le classement', 'Affiche les contrôles pour mettre directement une carte en vente depuis le classement.'],
             ['compactMode', 'Mode compact', 'Ajoute le bouton Compact dans les vues collection.'],
@@ -71,7 +67,7 @@
           title: 'Marché',
           description: 'Outils pour suivre tes enchères.',
           items: [
-            ['myBids', 'Afficher la page Mes enchères', 'Ajoute Mes enchères au menu latéral avec suivi des enchères, surenchère en un clic et alerte sonore sous 1 minute. Désactive cette option pour masquer entièrement la page et son entrée dans le menu.']
+            ['myBids', 'Afficher la page Mes enchères', 'Ajoute Mes enchères au menu latéral avec suivi des enchères (bouton « Actualiser »), surenchère en un clic et alerte sonore sous 1 minute. Désactive cette option pour masquer entièrement la page et son entrée dans le menu.']
           ]
         },
         {
@@ -80,9 +76,7 @@
           items: [
             ['packRecap', 'Récapitulatif des prix', 'Affiche le récap des cartes et de leurs prix après un paquet.'],
             ['pullShareButton', 'Bouton « Partager » pendant l’ouverture', 'Affiche le bouton Partager sur /pull pour copier l’écran de la carte en cours d’ouverture.'],
-            ['pullStats', 'Statistiques de tirage', 'Compte les raretés obtenues et affiche leur répartition.'],
-            ['openAll', 'Bouton « Tout ouvrir »', 'Permet d’ouvrir tous les paquets disponibles sans les animations.'],
-            ['autoOpen', 'Ouverture automatique', 'Permet les cycles automatiques avec un intervalle aléatoire personnalisable.']
+            ['pullStats', 'Statistiques de tirage', 'Compte les raretés obtenues et affiche leur répartition.']
           ]
         },
         {
@@ -179,8 +173,10 @@
         return { ...readSettings() };
       }
 
+      // Une option retirée (ouverture de paquets, chargement massif : interdits par le règlement du site)
+      // reste désactivée même si un ancien réglage l'activait.
       function isEnabled(key) {
-        return readSettings()[key] !== false;
+        return Object.hasOwn(DEFAULTS, key) && readSettings()[key] !== false;
       }
 
       function saveSettings(settings) {
@@ -281,79 +277,6 @@
             row.classList.toggle('is-enabled', input.checked);
             row.append(copy, toggle);
             list.append(row);
-          }
-
-          if (category.title === 'Paquets') {
-            const intervalRow = document.createElement('div');
-            intervalRow.className = 'wm-settings-row wm-settings-interval-row';
-
-            const intervalCopy = document.createElement('span');
-            intervalCopy.className = 'wm-settings-copy';
-
-            const intervalLabel = document.createElement('strong');
-            intervalLabel.textContent = 'Intervalle d’ouverture automatique';
-
-            const intervalDescription = document.createElement('span');
-            intervalDescription.textContent = 'Un délai aléatoire est choisi entre ces deux valeurs.';
-            intervalCopy.append(intervalLabel, intervalDescription);
-
-            const intervalFields = document.createElement('div');
-            intervalFields.className = 'wm-settings-interval-fields';
-
-            const createMinuteField = (labelText, value, onChange) => {
-              const field = document.createElement('label');
-              field.className = 'wm-settings-minute-field';
-
-              const fieldLabel = document.createElement('span');
-              fieldLabel.textContent = labelText;
-
-              const input = document.createElement('input');
-              input.type = 'number';
-              input.min = '1';
-              input.max = '10080';
-              input.step = '1';
-              input.inputMode = 'numeric';
-              input.value = String(value);
-              input.addEventListener('input', () => onChange(input.value));
-
-              field.append(fieldLabel, input);
-              return { field, input };
-            };
-
-            const minField = createMinuteField(
-              'Min',
-              draftAutoOpenInterval.minMinutes,
-              (value) => {
-                draftAutoOpenInterval = {
-                  ...draftAutoOpenInterval,
-                  minMinutes: value
-                };
-              }
-            );
-
-            const maxField = createMinuteField(
-              'Max',
-              draftAutoOpenInterval.maxMinutes,
-              (value) => {
-                draftAutoOpenInterval = {
-                  ...draftAutoOpenInterval,
-                  maxMinutes: value
-                };
-              }
-            );
-
-            intervalFields.append(minField.field, maxField.field);
-
-            const unit = document.createElement('span');
-            unit.className = 'wm-settings-interval-unit';
-            unit.textContent = 'min';
-            intervalFields.append(unit);
-
-            intervalRow.append(intervalCopy, intervalFields);
-            list.append(intervalRow);
-
-            inputs.set('__autoOpenMin', minField.input);
-            inputs.set('__autoOpenMax', maxField.input);
           }
 
           section.append(sectionHead, list);

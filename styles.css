@@ -26,6 +26,17 @@
   border-color: rgba(209, 213, 219, 0.35);
 }
 
+.wm-average-badge.wm-average-ask {
+  color: #c4b5fd;
+  border-color: rgba(196, 181, 253, 0.45);
+  border-style: dashed;
+}
+
+.wm-average-badge[data-wm-ask-id] {
+  cursor: pointer;
+  pointer-events: auto;
+}
+
 .wm-average-badge.wm-average-loading {
   display: inline-flex;
   align-items: center;
@@ -551,6 +562,17 @@
   white-space: nowrap;
 }
 
+.wm-marketplace-average-ask {
+  padding: 7px 12px;
+  border: 1px dashed rgba(191, 148, 255, 0.6);
+  border-radius: 9px;
+  font-size: 13px;
+}
+
+.wm-marketplace-average-value[data-wm-ask-id] {
+  cursor: pointer;
+}
+
 .wm-marketplace-average-loading {
   display: inline-flex;
   align-items: center;
@@ -883,6 +905,12 @@
   align-items: center;
   gap: 4px;
   color: #94a3b8;
+}
+
+.wm-pack-recap-price.is-ask {
+  color: #c4b5fd;
+  cursor: pointer;
+  text-decoration: underline dashed;
 }
 
 .wm-pack-recap-price.is-empty {

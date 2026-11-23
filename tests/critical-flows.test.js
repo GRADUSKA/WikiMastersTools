@@ -40,6 +40,7 @@ function priceHarness(extras) {
   const core = registry.core.create();
   const runtime = { core, settings: { isEnabled: () => true } };
   runtime.priceUi = registry.priceUi.create(runtime);
+  runtime.priceLoader = registry.priceLoader.create(runtime);
   return { ...h, core, runtime };
 }
 function packHarness(fetch, navigator) {
@@ -77,12 +78,12 @@ test('null, valeurs vides, booléens et prix négatifs ne deviennent pas des pri
   }
 });
 
-test('cache : TTL de 24 h, Retry-After borné et horodatages futurs rejetés', () => {
+test('cache : un prix obtenu ne périme jamais, Retry-After borné et horodatages futurs rejetés', () => {
   const {core} = priceHarness();
   const now = 100000000;
   const entry = {ok:true, fetchedAt:now, averages:{C:3}};
   assert.equal(core.isCacheEntryValid(entry, now), true);
-  assert.equal(core.isCacheEntryValid(entry, now + core.CACHE_TTL), false);
+  assert.equal(core.isCacheEntryValid(entry, now + 365 * core.CACHE_TTL), true);
   assert.equal(core.isCacheEntryValid(entry, now - 1), false);
   assert.equal(core.isCacheEntryValid({...entry,ok:false,retryAfterMs:120000}, now + 90000), true);
   assert.equal(core.isCacheEntryValid({...entry,ok:false,retryAfterMs:Infinity}, now + 300000), false);
@@ -92,7 +93,7 @@ test('cache : TTL de 24 h, Retry-After borné et horodatages futurs rejetés', (
 test('la réponse met à jour tous les exemplaires et respecte leur rareté affichée', () => {
   const badges = [];
   const cards = ['C','UR','UR'].map(rarity => {
-    const badge = {className:'wm-average-badge', classList:{contains:() => false}, parentElement:{}, textContent:'Prix…'};
+    const badge = {className:'wm-average-badge', classList:{contains:() => false}, parentElement:{}, textContent:'Prix…', dataset:{}};
     badges.push(badge);
     return {dataset:{wmCardId:'a'}, querySelector:selector => selector === '.wm-average-badge' ? badge : null,
       querySelectorAll:() => [{textContent:rarity}]};
@@ -106,7 +107,7 @@ test('la réponse met à jour tous les exemplaires et respecte leur rareté affi
 
 test('des milliers de prix rendus dans la même tâche ne parcourent la page qu’une fois', async () => {
   let scans = 0;
-  const badge = {classList:{contains:() => true}, parentElement:{}, textContent:'Prix…'};
+  const badge = {classList:{contains:() => true}, parentElement:{}, textContent:'Prix…', dataset:{}};
   const cards = ['a','b'].map(id => ({dataset:{wmCardId:id}, querySelector:selector => selector === '.wm-average-badge' ? badge : null, querySelectorAll:() => []}));
   const document = {querySelectorAll:selector => { if (selector === '[data-wm-card-id]') scans++; return selector === '[data-wm-card-id]' ? cards : []; }};
   const {runtime} = priceHarness({document});
@@ -151,56 +152,116 @@ function loaderHarness(extras) {
   return {...h, loader, requests, rendered, progress, finished:() => finished};
 }
 
-test('la file déduplique les cartes et limite à trois requêtes simultanées', () => {
+const cards = ids => ids.map(id => ({...card,id}));
+const answer = (h, request, averages = {C:1}) => h.send('wm-average-response',{...request,ok:true,averages});
+
+test('sans clic, aucun prix n’est demandé au site', () => {
   const h = loaderHarness();
-  h.loader.loadCacheForCards([card, card, ...['b','c','d'].map(id => ({...card,id}))]);
-  assert.equal(h.requests.length, 3);
-  h.send('wm-average-response',{...h.requests[0], ok:true, averages:{C:1}});
-  assert.equal(h.requests.length, 4);
-  assert.equal(h.requests.filter(r => r.id === 'a').length, 1);
+  h.loader.loadCacheForCards(cards(['a','b','c']));
+  h.loader.loadCacheForCards(cards(['d']), {priority:true, markBulk:true});
+  assert.equal(h.requests.length, 0);
+  assert.equal(h.loader.isPending('a'), false);
 });
 
-test('les réponses inconnues et dupliquées ne libèrent aucun emplacement', () => {
+test('un prix connu reste affiché quel que soit son âge, sans être redemandé', async () => {
+  const store = new Map([['wm_avg_v4_a', JSON.stringify({ok:true,fetchedAt:Date.parse('2026-01-01T00:00:00Z'),averages:{C:7}})]]);
+  const h = loaderHarness({ localStorage: {
+    getItem: key => store.has(key) ? store.get(key) : null, setItem: (key, value) => store.set(key, value)
+  }});
+  h.loader.loadCacheForCards([card]);
+  assert.equal(h.core.cacheMemory.get('a').averages.C, 7);
+  assert.equal(h.requests.length, 0);
+  // Un clic sur un prix ancien le redemande.
+  h.loader.loadCacheForCards([card], {manual:true});
+  assert.equal(h.requests.length, 1);
+});
+
+test('les clics partent une carte à la fois, espacées de 4 s, sans doublon', async () => {
   const h = loaderHarness();
-  h.loader.loadCacheForCards(['a','b','c','d','e'].map(id => ({...card,id})));
+  h.loader.loadCacheForCards(cards(['a','a','b']), {manual:true});
+  h.loader.loadCacheForCards(cards(['b']), {manual:true});
+  assert.deepEqual(h.requests.map(r => r.id), ['a']);
+  answer(h, h.requests[0]);
+  assert.equal(h.requests.length, 1);
+  await h.advance(3999); assert.equal(h.requests.length, 1);
+  await h.advance(1); assert.deepEqual(h.requests.map(r => r.id), ['a','b']);
+  answer(h, h.requests[1]);
+  await h.advance(60000); assert.equal(h.requests.length, 2);
+});
+
+test('un clic sur un prix de moins d’un jour n’envoie rien ; les communes restent fraîches 7 jours', async () => {
+  const h = loaderHarness();
+  h.loader.loadCacheForCards([{...card,id:'c1',rarity:'C'}], {manual:true});
+  answer(h, h.requests[0]);
+  await h.advance(4000);
+  h.loader.loadCacheForCards([{...card,id:'r1',rarity:'R'}], {manual:true});
+  answer(h, h.requests[1], {R:100});
+  await h.advance(60000);
+  h.loader.loadCacheForCards([{...card,id:'c1',rarity:'C'},{...card,id:'r1',rarity:'R'}], {manual:true});
+  assert.equal(h.requests.length, 2);
+
+  const start = Date.parse('2026-10-05T12:00:00Z'), day = 24 * 60 * 60 * 1000;
+  assert.equal(h.loader.isFresh(h.core.cacheMemory.get('c1'), start + 3 * day), true);
+  assert.equal(h.loader.isFresh(h.core.cacheMemory.get('r1'), start + day + 5000), false);
+});
+
+test('les réponses inconnues et dupliquées ne libèrent aucun emplacement', async () => {
+  const h = loaderHarness();
+  h.loader.loadCacheForCards(cards(['a','b']), {manual:true});
   h.send('wm-average-response',{requestId:'inconnu',id:'b',ok:true});
-  assert.equal(h.requests.length, 3);
-  const first = h.requests[0];
-  h.send('wm-average-response',{...first,ok:true,averages:{C:1}});
-  assert.equal(h.requests.length, 4);
-  h.send('wm-average-response',{...first,ok:true,averages:{C:999}});
-  assert.equal(h.requests.length, 4);
+  await h.advance(5000);
+  assert.equal(h.requests.length, 1);
+  answer(h, h.requests[0]);
+  answer(h, h.requests[0], {C:999});
   assert.equal(h.core.cacheMemory.get('a').averages.C, 1);
 });
 
 test('une requête sans réponse expire et la file reprend', async () => {
   const h = loaderHarness();
-  h.loader.loadCacheForCards(['a','b','c','d'].map(id => ({...card,id})));
+  h.loader.loadCacheForCards(cards(['a','b']), {manual:true});
   await h.advance(80000);
-  assert.equal(h.requests.length, 4);
+  assert.equal(h.requests.length, 2);
   assert.equal(h.core.cacheMemory.get('a').ok, false);
-  const fourth = h.requests[3];
-  h.send('wm-average-response',{...fourth,ok:true,averages:{C:1}});
-  assert.equal(h.loader.isPending('d'), false);
-  h.send('wm-average-response',{...h.requests[0],ok:true,averages:{C:999}});
+  answer(h, h.requests[0], {C:999});
   assert.equal(h.core.cacheMemory.get('a').ok, false);
 });
 
-test('le chargement massif compte les ids uniques et se termine après succès ou erreur', () => {
+test('un échec ne remplace pas un ancien prix, une erreur de rendu ne bloque pas la file', async () => {
   const h = loaderHarness();
-  h.loader.loadCacheForCards([card,card,{...card,id:'b'}],{markBulk:true});
-  assert.equal(h.progress[0][0],2);
-  h.send('wm-average-response',{...h.requests[0],ok:true,averages:{C:1}});
-  h.send('wm-average-response',{...h.requests[1],ok:false});
-  assert.equal(h.finished(),1);
-});
-
-test('une erreur de rendu ne bloque pas le paquet de prix suivant', () => {
-  const h = loaderHarness();
-  h.loader.loadCacheForCards(['a','b','c','d'].map(id => ({...card,id})));
+  h.loader.loadCacheForCards(cards(['a','b']), {manual:true});
+  answer(h, h.requests[0]);
+  await h.advance(4000);
   h.runtime.priceUi.renderKnownCard = () => { throw new Error('DOM retiré'); };
-  h.send('wm-average-response',{...h.requests[0],ok:true,averages:{C:1}});
-  assert.equal(h.requests.length,4);
+  answer(h, h.requests[1]);
+  h.core.cacheMemory.set('a', {...h.core.cacheMemory.get('a'), fetchedAt: Date.now() - 2 * 24 * 60 * 60 * 1000});
+  h.runtime.priceUi.renderKnownCard = () => {};
+  await h.advance(4000);
+  h.loader.loadCacheForCards(cards(['a']), {manual:true});
+  h.send('wm-average-response',{...h.requests.at(-1),ok:false});
+  assert.equal(h.core.cacheMemory.get('a').ok, true);
+});
+
+test('un blocage du site arrête tout : clics en attente abandonnés, pause d’au moins 10 min', async () => {
+  const h = loaderHarness();
+  h.loader.loadCacheForCards(cards(['a','b','c']), {manual:true});
+  h.send('wm-average-response',{...h.requests[0],ok:false,rateLimited:true,retryAfterHintMs:5000});
+  assert.equal(h.loader.isPending('b'), false);
+  assert.equal(h.core.cacheMemory.has('a'), false);
+  await h.advance(60 * 60 * 1000);
+  assert.equal(h.requests.length, 1);
+});
+
+test('pendant la pause d’un autre onglet, un clic n’envoie rien et n’est pas rejoué', async () => {
+  const store = new Map([['wm_price_block_until_v1', String(Date.parse('2026-10-05T12:00:00Z') + 30000)]]);
+  const h = loaderHarness({ localStorage: {
+    getItem: key => store.has(key) ? store.get(key) : null, setItem: (key, value) => store.set(key, value)
+  }});
+  assert.equal(h.loader.isBlocked(), true);
+  h.loader.loadCacheForCards([card], {manual:true});
+  await h.advance(60000);
+  assert.equal(h.requests.length,0);
+  h.loader.loadCacheForCards([card], {manual:true});
+  assert.equal(h.requests.length,1);
 });
 
 test('Tout ouvrir conserve les cartes et s’arrête quand le serveur annonce zéro', async () => {
@@ -400,21 +461,35 @@ function salesHarness(fetch) {
   return {...h,results};
 }
 
-test('le résumé de ventes filtre les prix invalides sans fabriquer des zéros', async () => {
-  const h = salesHarness(async () => response({summary:{C:{average:null},UR:{average:'120.5'},L:{average:0},SR:{average:-2},unknown:{average:10}}}));
+test('le prix est la moyenne de la dernière semaine avec des ventes, comme l’onglet Marché du site', async () => {
+  let url = null;
+  const h = salesHarness(async (requested) => { url = requested; return response({by_rarity:{
+    UR:{weekly:[{start:'2026-11-23',avg:300,count:1},{start:'2026-11-09',avg:243,count:48},{start:'2026-11-16',avg:312,count:51}],monthly:[]},
+    L:{weekly:[{start:'2026-11-02',avg:0,count:2},{start:'2026-11-09',avg:null,count:3},{start:'2026-11-16',avg:900,count:0}]},
+    SR:{weekly:[{start:'2026-11-16',avg:-2,count:1}]},
+    X:{weekly:[{start:'2026-11-16',avg:10,count:1}]}
+  }}); });
   await flush();
+  assert.match(url,/\/cards\/a\/price-history$/);
   assert.equal(h.results[0].ok,true);
-  assert.equal(JSON.stringify(h.results[0].averages),JSON.stringify({UR:120.5,L:0}));
+  assert.equal(JSON.stringify(h.results[0].averages),JSON.stringify({UR:300,L:0}));
   assert.equal(h.timers.size,0);
 });
 
-test('un résumé absent échoue après trois essais au lieu de cacher une réponse vide 24 h', async () => {
+test('une réponse de format inconnu échoue en une seule requête au lieu de cacher une réponse vide', async () => {
   let calls=0;
   const h = salesHarness(async () => {calls++; return response({});});
   await flush(); await h.advance(1000);
-  assert.equal(calls,3);
+  assert.equal(calls,1);
   assert.equal(h.results[0].ok,false);
   assert.equal(h.timers.size,0);
+});
+
+test('aucune vente : prix connu mais vide, pas une erreur', async () => {
+  const h = salesHarness(async () => response({computed_at:'2026-11-23',by_rarity:{}}));
+  await flush();
+  assert.equal(h.results[0].ok,true);
+  assert.equal(JSON.stringify(h.results[0].averages),'{}');
 });
 
 test('HTTP 429 respecte Retry-After sans relancer immédiatement', async () => {
@@ -424,16 +499,6 @@ test('HTTP 429 respecte Retry-After sans relancer immédiatement', async () => {
   assert.equal(calls,1);
   assert.equal(h.results[0].rateLimited,true);
   assert.equal(h.results[0].retryAfterMs,120000);
-});
-
-test('une limitation des prix suspend aussi les prochaines cartes de la file', async () => {
-  const h = loaderHarness();
-  h.loader.loadCacheForCards(['a','b','c','d'].map(id => ({...card,id})));
-  h.send('wm-average-response',{...h.requests[0],ok:false,rateLimited:true,retryAfterMs:120000,retryAfterHintMs:120000});
-  assert.equal(h.requests.length,3);
-  await h.advance(119999); assert.equal(h.requests.length,3);
-  // Reprise : une seule requête de sonde tant qu'aucune ne passe.
-  await h.advance(1); assert.equal(h.requests.length,4);
 });
 
 test('la collection abandonne après trois erreurs réseau et rend le contrôle à l’interface', async () => {
@@ -542,7 +607,7 @@ function packsUiHarness({ savedRecap = null } = {}) {
   const registry=h.window.__wmAverageFeatures;
   const core=registry.core.create(); core.isLastPullCardVisible=() => false;
   const recorded=[], requests=[], cancellations=[];
-  const runtime={core,settings:{isEnabled:() => true},pullStats:{recordPullStats:cards => recorded.push(cards)},priceLoader:{loadCacheForCards() {}},modalUi:{showInfoModal() {}}};
+  const runtime={core,settings:{isEnabled:() => true},pullStats:{recordPullStats:cards => recorded.push(cards)},priceLoader:{loadCacheForCards() {},isPending:() => false},modalUi:{showInfoModal() {}}};
   runtime.priceUi=registry.priceUi.create(runtime);
   runtime.packs=registry.packs.create(runtime);
   runtime.packs.ensurePullsToolbar();
@@ -617,7 +682,7 @@ test('le récap natif évite de recréer le DOM quand les prix n’ont pas chang
   const fresh=harness(['features/core.js','features/price-ui.js','features/packs.js'], {document,localStorage:storageFixture(),sessionStorage:storageFixture(),location:{pathname:'/pulls'}});
   const registry=fresh.window.__wmAverageFeatures, core=registry.core.create();
   core.isLastPullCardVisible=() => true;
-  const runtime={core,settings:{isEnabled:() => true},pullStats:{recordPullStats() {}},priceLoader:{loadCacheForCards() {}}};
+  const runtime={core,settings:{isEnabled:() => true},pullStats:{recordPullStats() {}},priceLoader:{loadCacheForCards() {},isPending:() => false}};
   runtime.priceUi=registry.priceUi.create(runtime); runtime.packs=registry.packs.create(runtime);
   fresh.send('wm-average-pack-opened',{cards:[card]});
   const panel=document.getElementById('wm-pack-recap'), children=panel.children;
@@ -625,7 +690,7 @@ test('le récap natif évite de recréer le DOM quand les prix n’ont pas chang
   assert.equal(panel.children,children);
 });
 
-test('la navigation entre annonces recharge le bon prix et ignore une ancienne réponse', () => {
+test('la navigation entre annonces n’envoie aucune requête et ignore une ancienne réponse', () => {
   const a='00000000-0000-0000-0000-000000000001', b='00000000-0000-0000-0000-000000000002';
   const h=priceHarness({document:{querySelectorAll:() => [],getElementById:() => null},location:{pathname:'/marketplace/'+a}});
   const loaded=[], requested=[];
@@ -634,14 +699,14 @@ test('la navigation entre annonces recharge le bon prix et ignore une ancienne r
   h.send('wm-average-marketplace-detail',{auctionId:a,card:{...card,id:'card-a'}});
   h.context.location.pathname='/marketplace/'+b;
   h.runtime.priceUi.renderMarketplaceCurrent();
-  assert.deepEqual(requested,[b]);
+  assert.deepEqual(requested,[]);
   h.send('wm-average-marketplace-detail',{auctionId:a,card:{...card,id:'card-a'}});
   assert.deepEqual(loaded,['card-a']);
   h.send('wm-average-marketplace-detail',{auctionId:b,card:{...card,id:'card-b'}});
   assert.deepEqual(loaded,['card-a','card-b']);
 });
 
-test('les ouvertures natives utilisent aussi le verrou des lots', async () => {
+test('une ouverture de paquet du site passe telle quelle, une seule requête, lue par l’extension', async () => {
   let calls=0;
   const h=harness(['bridge/core.js','bridge/packs.js','bridge/intercept.js'], {
     navigator:{locks:{request:(_name,_opts,callback) => Promise.resolve().then(() => callback(null))}}
@@ -650,9 +715,7 @@ test('les ouvertures natives utilisent aussi le verrou des lots', async () => {
   const registry=h.window.__wmBridgeFeatures, core=registry.bridgeCore.create();
   const runtime={core}; runtime.packs=registry.bridgePacks.create(runtime);
   registry.bridgeIntercept.create(runtime);
-  await assert.rejects(h.window.fetch('/api/packs/open',{method:'POST'}),/autre onglet/);
-  assert.equal(calls,0);
-  await h.window.fetch('/api/my-collection');
+  await h.window.fetch('/api/packs/open',{method:'POST'});
   assert.equal(calls,1);
 });
 
@@ -716,29 +779,17 @@ test('les minuteurs passent par un Worker et retombent sur setTimeout s’il éc
   await h.advance(1); assert.equal(fired, 2);
 });
 
-test('un 403 sur la collection est retenté après une pause, puis réussit', async () => {
-  const h = harness(['bridge/core.js']);
-  let calls = 0;
-  h.window.fetch = async () => ++calls === 1 ? new Response('blocked',{status:403}) : response({ok:true});
-  const core = h.window.__wmBridgeFeatures.bridgeCore.create();
-  const run = core.fetchJsonRetry('/api/my-collection',{}, {label:'Collection page 117'});
-  await flush();
-  assert.equal(calls,1);
-  await h.advance(2999); assert.equal(calls,1);
-  await h.advance(1);
-  assert.deepEqual(await run,{ok:true});
-  assert.equal(calls,2);
-});
-
-test('un 403 persistant échoue après trois essais avec le statut sur l’erreur', async () => {
-  const h = harness(['bridge/core.js']);
-  let calls = 0;
-  h.window.fetch = async () => { calls++; return new Response('blocked',{status:403}); };
-  const core = h.window.__wmBridgeFeatures.bridgeCore.create();
-  const run = core.fetchJsonRetry('/api/my-collection',{}, {label:'Collection page 117'});
-  const rejected = assert.rejects(run, error => error.status === 403 && /Collection page 117: HTTP 403/.test(error.message));
-  await flush(); await h.advance(60000); await rejected;
-  assert.equal(calls,3);
+test('un 403 ou 429 du site arrête la requête sans nouvel essai, avec le statut sur l’erreur', async () => {
+  for (const status of [403, 429]) {
+    const h = harness(['bridge/core.js']);
+    let calls = 0;
+    h.window.fetch = async () => { calls++; return new Response('blocked',{status}); };
+    const core = h.window.__wmBridgeFeatures.bridgeCore.create();
+    const run = core.fetchJsonRetry('/api/my-collection',{}, {label:'Collection page 117'});
+    const rejected = assert.rejects(run, error => error.status === status && /Collection page 117: HTTP/.test(error.message));
+    await flush(); await h.advance(60000); await rejected;
+    assert.equal(calls,1);
+  }
 });
 
 test('HTTP 403 sur les prix suspend la file comme une limitation', async () => {
@@ -748,124 +799,6 @@ test('HTTP 403 sur les prix suspend la file comme une limitation', async () => {
   assert.equal(calls,1);
   assert.equal(h.results[0].rateLimited,true);
   assert.equal(h.results[0].retryAfterMs,60000);
-});
-
-const blockResponse = (h, requests) => requests.forEach(request =>
-  h.send('wm-average-response',{...request,ok:false,rateLimited:true,retryAfterMs:60000}));
-
-test('une carte bloquée par le site est retentée après la pause au lieu d’être perdue', async () => {
-  const h = loaderHarness();
-  h.loader.loadCacheForCards(['a','b'].map(id => ({...card,id})),{markBulk:true});
-  blockResponse(h,[h.requests[0]]);
-  assert.equal(h.core.cacheMemory.has('a'),false);
-  assert.deepEqual(h.progress.at(-1),[2,2,true,0]);
-  blockResponse(h,[h.requests[1]]);
-  await h.advance(999); assert.equal(h.requests.length,2);
-  await h.advance(1);
-  assert.equal(h.requests.length,3);
-  assert.equal(h.requests[2].id,'a');
-});
-
-test('après un blocage, une seule sonde à la fois, espacée selon Fibonacci : 1, 2, 3, 5 s', async () => {
-  const h = loaderHarness();
-  h.loader.loadCacheForCards(['a','b','c'].map(id => ({...card,id})));
-
-  blockResponse(h,h.requests.slice(0,3));
-  let sent = h.requests.length;
-  for (const waitMs of [1000, 2000, 3000, 5000]) {
-    await h.advance(waitMs - 1); assert.equal(h.requests.length,sent);
-    await h.advance(1); assert.equal(h.requests.length,sent + 1);
-    sent += 1;
-    blockResponse(h,[h.requests[sent - 1]]);
-  }
-});
-
-test('le rythme est déduit du blocage : séries réussies puis durée jusqu’à la réouverture', async () => {
-  const h = loaderHarness();
-  h.loader.loadCacheForCards(Array.from({length:20},(_,n) => ({...card,id:`c${n}`})));
-  const ok = request => h.send('wm-average-response',{...request,ok:true,averages:{C:1}});
-
-  h.requests.slice(0,3).forEach(ok);
-  h.requests.slice(3,6).forEach(ok);
-  blockResponse(h,h.requests.slice(6,9));
-  assert.equal(h.requests.length,9);
-
-  // Trois sondes bloquées (à 1, 3 et 6 s), la quatrième passe à 11 s.
-  for (const waitMs of [1000, 2000, 3000]) {
-    await h.advance(waitMs);
-    blockResponse(h,[h.requests.at(-1)]);
-  }
-  await h.advance(5000);
-  assert.equal(h.requests.length,13);
-  ok(h.requests[12]);
-
-  // 6 requêtes tolérées pour 11 s de série + blocage : 11000 × 1,15 / 6 ≈ 2108 ms entre deux requêtes.
-  await h.advance(2107); assert.equal(h.requests.length,13);
-  await h.advance(1); assert.equal(h.requests.length,14);
-});
-
-test('le temps sans requête avant une série n’entre pas dans le calcul du rythme', async () => {
-  const h = loaderHarness();
-  const ok = request => h.send('wm-average-response',{...request,ok:true,averages:{C:1}});
-  h.loader.loadCacheForCards(['x0','x1','x2'].map(id => ({...card,id})));
-  h.requests.forEach(ok);
-  await h.advance(360000);
-
-  const base = h.requests.length;
-  h.loader.loadCacheForCards(Array.from({length:20},(_,n) => ({...card,id:`c${n}`})));
-  h.requests.slice(base,base + 3).forEach(ok);
-  h.requests.slice(base + 3,base + 6).forEach(ok);
-  blockResponse(h,h.requests.slice(base + 6,base + 9));
-  for (const waitMs of [1000, 2000, 3000]) {
-    await h.advance(waitMs);
-    blockResponse(h,[h.requests.at(-1)]);
-  }
-  await h.advance(5000);
-  ok(h.requests.at(-1));
-
-  // Même résultat que sans le silence de 6 minutes : 11000 × 1,15 / 6 ≈ 2108 ms.
-  const sent = h.requests.length;
-  await h.advance(2107); assert.equal(h.requests.length,sent);
-  await h.advance(1); assert.equal(h.requests.length,sent + 1);
-});
-
-test('une série trop courte pour conclure ne ralentit pas le rythme à chaque blocage', async () => {
-  const h = loaderHarness();
-  h.loader.loadCacheForCards(Array.from({length:20},(_,n) => ({...card,id:`c${n}`})));
-  const ok = request => h.send('wm-average-response',{...request,ok:true,averages:{C:1}});
-
-  blockResponse(h,h.requests.slice(0,3));
-  await h.advance(1000); ok(h.requests.at(-1));
-  for (let episode = 0; episode < 3; episode++) {
-    let sent = h.requests.length;
-    await h.advance(1999); assert.equal(h.requests.length,sent);
-    await h.advance(1); assert.equal(h.requests.length,sent + 1);
-    blockResponse(h,[h.requests.at(-1)]);
-    await h.advance(2000); assert.equal(h.requests.length,sent + 2);
-    ok(h.requests.at(-1));
-  }
-});
-
-test('un ancien rythme enregistré sans version est ignoré', () => {
-  const store = new Map([['wm_price_pace_v1', JSON.stringify({gapMs:5063,savedAt:Date.parse('2026-10-05T12:00:00Z')})]]);
-  const h = loaderHarness({ localStorage: {
-    getItem: key => store.has(key) ? store.get(key) : null,
-    setItem: (key, value) => store.set(key, value)
-  }});
-  h.loader.loadCacheForCards(['a','b'].map(id => ({...card,id})));
-  assert.equal(h.requests.length,2);
-});
-
-test('la pause d’un autre onglet est respectée avant toute requête', async () => {
-  const store = new Map([['wm_price_block_until_v1', String(Date.parse('2026-10-05T12:00:00Z') + 30000)]]);
-  const h = loaderHarness({ localStorage: {
-    getItem: key => store.has(key) ? store.get(key) : null,
-    setItem: (key, value) => store.set(key, value)
-  }});
-  h.loader.loadCacheForCards([card]);
-  assert.equal(h.requests.length,0);
-  await h.advance(29999); assert.equal(h.requests.length,0);
-  await h.advance(1); assert.equal(h.requests.length,1);
 });
 
 test('la liste du Marketplace est lue, mais pas la requête « mine=1 » de Mes enchères', () => {
@@ -890,38 +823,13 @@ test('la liste du Marketplace est lue, mais pas la requête « mine=1 » de Mes 
   ]]));
 });
 
-test('une carte demandée en priorité passe devant la file d’un chargement complet', async () => {
-  const h = loaderHarness();
-  h.loader.loadCacheForCards(['a','b','c','d','e'].map(id => ({...card, id})));
-  assert.equal(h.requests.length,3);
-
-  h.loader.loadCacheForCards([{...card,id:'e'},{...card,id:'x'}], {priority:true});
-  h.send('wm-average-response',{...h.requests[0],ok:true,averages:{C:1}});
-  h.send('wm-average-response',{...h.requests[1],ok:true,averages:{C:1}});
-  await flush();
-  assert.deepEqual(h.requests.slice(3).map(request => request.id),['e','x']);
-});
-
-test('le prix des communes et des cartes à moins de 5 W reste valide 7 jours, les autres 24 h', () => {
-  const h = loaderHarness();
-  h.loader.loadCacheForCards([{...card,id:'c1',rarity:'C'},{...card,id:'r1',rarity:'R'},{...card,id:'r2',rarity:'R'}]);
-  h.requests.forEach(request => h.send('wm-average-response',{...request,ok:true,averages:{C:1,R:request.id === 'r2' ? 2 : 100}}));
-
-  const now = Date.parse('2026-10-05T12:00:00Z');
-  const day = 24 * 60 * 60 * 1000;
-  assert.equal(h.core.isCacheEntryValid(h.core.cacheMemory.get('c1'), now + 3 * day),true);
-  assert.equal(h.core.isCacheEntryValid(h.core.cacheMemory.get('c1'), now + 8 * day),false);
-  assert.equal(h.core.isCacheEntryValid(h.core.cacheMemory.get('r1'), now + 25 * 60 * 60 * 1000),false);
-  assert.equal(h.core.isCacheEntryValid(h.core.cacheMemory.get('r2'), now + 3 * day),true);
-});
-
 test('une moyenne de 0 n’est pas traitée comme une carte bon marché', () => {
   const h = loaderHarness();
-  h.loader.loadCacheForCards([{...card,id:'r0',rarity:'R'}]);
+  h.loader.loadCacheForCards([{...card,id:'r0',rarity:'R'}], {manual:true});
   h.requests.forEach(request => h.send('wm-average-response',{...request,ok:true,averages:{R:0}}));
 
   const now = Date.parse('2026-10-05T12:00:00Z');
-  assert.equal(h.core.isCacheEntryValid(h.core.cacheMemory.get('r0'), now + 25 * 60 * 60 * 1000),false);
+  assert.equal(h.loader.isFresh(h.core.cacheMemory.get('r0'), now + 25 * 60 * 60 * 1000),false);
 });
 
 test('une carte vue au Marketplace ou en enchère ne garde ni rareté ni compte si elle est possédée', () => {
@@ -1180,5 +1088,5 @@ test('une erreur tardive garde les pages déjà lues et les signale comme partie
   assert.equal(h.results[0].complete,false);
   assert.match(h.results[0].partialError,/Collection page 2: HTTP 403/);
   assert.equal(h.results[0].cards.length,6);
-  assert.deepEqual(h.pages,[0,1,2,2,2]);
+  assert.deepEqual(h.pages,[0,1,2]);
 });

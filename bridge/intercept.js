@@ -15,9 +15,8 @@
         const input = args[0];
         const url = typeof input === 'string' ? input : input?.url;
         const method = args[1]?.method || input?.method || 'GET';
-        const fetchPromise = url && isPacksOpenApi(url) && method.toUpperCase() === 'POST'
-          ? runtime.packs.withOpeningLock(() => originalFetch(...args))
-          : originalFetch(...args);
+        // Lecture seule : les requêtes du site partent telles quelles, l'extension n'en ajoute aucune.
+        const fetchPromise = originalFetch(...args);
 
         fetchPromise.then((response) => {
           try {
@@ -97,17 +96,7 @@
         };
       }
 
-      window.addEventListener('wm-average-load-all-collection', (event) => {
-        const requestId = event.detail?.requestId;
-        if (!requestId) return;
-
-        const selectedRarities = Array.isArray(event.detail?.selectedRarities)
-          ? event.detail.selectedRarities
-          : [];
-
-        runtime.collection.fetchAllCollection(requestId, selectedRarities);
-      });
-
+      // Ni « Tout ouvrir » ni chargement complet de la collection : retirés, interdits par le règlement du site.
       window.addEventListener('wm-average-load-tag-cards', (event) => {
         const { requestId, tagId } = event.detail || {};
         if (!requestId || !tagId) return;
@@ -124,12 +113,6 @@
         const requestId = event.detail?.requestId;
         if (!requestId) return;
         runtime.collection.fetchTagOptions(requestId);
-      });
-
-      window.addEventListener('wm-average-open-all-packs', (event) => {
-        const requestId = event.detail?.requestId;
-        if (!requestId) return;
-        runtime.packs.openAllPacks(requestId);
       });
 
       window.addEventListener('wm-average-load-trades', () => {

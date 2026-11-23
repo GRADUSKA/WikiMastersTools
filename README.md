@@ -70,6 +70,15 @@ paquet réel n'est consommé par ces tests.
 
 *Heure de Paris*
 
+- **23/11/2026 — v4.38.0** — Les prix remarchent : le site ne donne plus de résumé des ventes. Le prix affiché est maintenant le même que dans l'onglet « Marché » d'une carte : la moyenne de la semaine en cours (ou de la dernière semaine avec des ventes), pour chaque rareté. Mode conforme au règlement du site (pas d'automatisation) :
+  - les prix ne se chargent plus tout seuls. Un prix inconnu affiche « Voir le prix » : un clic le charge, une carte à la fois, au plus une requête toutes les 4 s. Un prix déjà chargé reste affiché pour toujours (cliquer dessus l'actualise s'il a plus d'un jour) ;
+  - sur la page d'une annonce du Marché, le cadre « Prix moyen » affiche aussi « Voir le prix » quand le prix est inconnu : un clic le charge ;
+  - les pages d'une annonce et des échanges ne redemandent plus elles-mêmes ce que le site vient de charger : l'extension lit seulement ses réponses ;
+  - au premier blocage du site (« Trop de requêtes automatisées »), tout s'arrête au moins 10 minutes, sans relance automatique ;
+  - « Tout ouvrir », l'ouverture automatique des paquets et « Charger les prix » sont retirés. À l'ouverture d'un paquet, l'extension n'envoie plus aucune requête et ne retient plus celle du site : elle lit seulement les cartes reçues ;
+  - « Mes enchères » ne se rafraîchit plus en boucle : bouton « Actualiser » ;
+  - une mise en vente refusée n'est plus relancée automatiquement ;
+  - les chargements de pages (étiquettes, familles, recherche « Mot entier » limitée à 10 pages) vont au rythme d'une page toutes les 1,5 s et s'arrêtent dès que le site refuse.
 - **16/11/2026 — v4.37.0** — Familles : nouvelle case « Mot entier » dans la recherche de cartes. « tri » trouve « Tri par tas » mais plus « actrice » ni « triangle » (titre ou catégorie, sans tenir compte des majuscules ni des accents). Les résultats arrivent sur une seule page, après parcours des 20 premières pages du site au maximum.
 - **16/11/2026 — v4.36.2** — GIFs : seules les illustrations fournies par le site comptent, comme ça tout le monde voit les mêmes cartes GIF. Les images retrouvées sur Wikimedia par l'extension ne sont plus prises en compte, et le bouton de recherche des images manquantes est retiré du bouton « GIFs » (l'affichage des images manquantes dans la collection ne change pas).
 - **16/11/2026 — v4.36.1** — Recherche des images manquantes (bouton « GIFs ») beaucoup plus rapide : Wikipédia est d'abord interrogé par lots de 50 titres, en français puis en anglais. Seules les cartes encore sans image passent ensuite par la recherche complète, une à une. Pour les cartes trouvées par lot, l'image de Wikipédia est retenue avant celle de Wikidata.

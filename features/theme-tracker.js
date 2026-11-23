@@ -14,13 +14,15 @@
       const STORAGE_KEY = 'wm_families_v1';
       const CARD_BATCH = 80;
       const SEARCH_MIN_LENGTH = 2;
-      const WHOLE_WORD_MAX_PAGES = 20;
+      const WHOLE_WORD_MAX_PAGES = 10;
+      // Une page toutes les 1,5 s au plus, comme une personne qui parcourt les résultats.
+      const PAGE_GAP_MS = 1500;
       const MAX_OWNERSHIP_KEYWORDS = 8;
       const MAX_OWNERSHIP_PAGES_PER_KEYWORD = 10;
       const OWNERSHIP_COVERAGE_TARGET = 0.95;
       const MAX_MARKET_PAGES_PER_CARD = 3;
       const MARKET_PAGE_SIZE = 50;
-      const MARKET_BATCH_RETRIES = 3;
+      const MARKET_BATCH_RETRIES = 0;
       const MARKET_BATCH_RETRY_DELAY = 5000;
 
       let activeFamilyId = null;
@@ -474,7 +476,6 @@
               !Number.isFinite(status) ||
               status === 408 ||
               status === 425 ||
-              status === 429 ||
               status >= 500;
 
             if (!retryable || attempt >= maxAttempts) break;
@@ -558,7 +559,7 @@
           const result = await searchGlobalCards(query, page);
           cards.push(...result.cards.filter((card) => matchesWholeWord(card, query)));
           if (!result.hasMore) return { cards, truncated: false };
-          await wait(45);
+          await wait(PAGE_GAP_MS);
         }
         return { cards, truncated: true };
       }
@@ -841,7 +842,7 @@
           }
 
           if (json?.hasMore === false || auctions.length < MARKET_PAGE_SIZE) break;
-          await wait(45);
+          await wait(PAGE_GAP_MS);
         }
 
         return [...listingsById.values()];
@@ -1167,7 +1168,7 @@
             break;
           }
 
-          await wait(45);
+          await wait(PAGE_GAP_MS);
         }
 
         return {

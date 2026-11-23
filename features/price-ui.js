@@ -12,7 +12,6 @@
       let collectionPriceObserver = null;
       let marketplaceCardId = null;
       let marketplaceRequestedPath = null;
-      let marketplaceRequestedAt = 0;
       let globalCollectionCardId = null;
       let globalCollectionInitializedId = null;
 
@@ -126,6 +125,30 @@
         badge.append(spinner, label);
       }
 
+      const dateFormat = new Intl.DateTimeFormat('fr-FR', { day: '2-digit', month: '2-digit' });
+      const timeFormat = new Intl.DateTimeFormat('fr-FR', { hour: '2-digit', minute: '2-digit' });
+
+      function renderAskBadge(badge, id) {
+        const blocked = runtime.priceLoader.isBlocked();
+        const text = blocked ? 'Prix en pause' : 'Voir le prix';
+        badge.className = 'wm-average-badge wm-average-ask';
+        badge.title = blocked
+          ? `Le site a limité les requêtes : réessaie après ${timeFormat.format(runtime.priceLoader.blockedUntil())}`
+          : 'Charger le prix moyen de cette carte';
+        if (badge.textContent !== text) badge.textContent = text;
+        if (!blocked) badge.dataset.wmAskId = id;
+      }
+
+      // Un clic sur le badge demande le prix de cette seule carte, sans ouvrir la carte du site.
+      window.addEventListener('click', (event) => {
+        const badge = event.target instanceof Element ? event.target.closest('[data-wm-ask-id]') : null;
+        if (!badge) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const meta = cardMetaById.get(badge.dataset.wmAskId);
+        if (meta) runtime.priceLoader.loadCacheForCards([meta], { manual: true });
+      }, true);
+
       function chooseAverage(cacheEntry, cardEl, explicitRarity = null) {
         if (cacheEntry?.ok === false) return null;
         const rarity = explicitRarity || getRarityFromCard(cardEl);
@@ -147,9 +170,15 @@
         }
         const badge = getOrCreateBadge(card);
         const cacheEntry = cacheMemory.get(id);
+        delete badge.dataset.wmAskId;
+
+        if (runtime.priceLoader.isPending(id)) {
+          renderLoadingBadge(badge);
+          return;
+        }
 
         if (!cacheEntry) {
-          renderLoadingBadge(badge);
+          renderAskBadge(badge, id);
           return;
         }
 
@@ -162,7 +191,12 @@
           return;
         }
 
-        if (badge.title !== 'Prix moyen des ventes') badge.title = 'Prix moyen des ventes';
+        const stale = !runtime.priceLoader.isFresh(cacheEntry);
+        const priceTitle = stale
+          ? `Prix moyen de la semaine au ${dateFormat.format(cacheEntry.fetchedAt)} : clic pour l'actualiser`
+          : 'Prix moyen de la semaine, comme l’onglet « Marché » du site';
+        if (badge.title !== priceTitle) badge.title = priceTitle;
+        if (stale) badge.dataset.wmAskId = id;
         const average = chooseAverage(cacheEntry, card, getRarityFromCard(card) || cardMetaById.get(id)?.rarity || null);
 
         if (average == null) {
@@ -351,7 +385,10 @@
         if (!valueEl) return;
 
         const cacheEntry = cacheMemory.get(id);
-        if (!cacheEntry) {
+        delete valueEl.dataset.wmAskId;
+        valueEl.removeAttribute('title');
+
+        if (runtime.priceLoader.isPending(id)) {
           valueEl.className = 'wm-marketplace-average-value wm-marketplace-average-loading';
           valueEl.replaceChildren();
 
@@ -366,9 +403,25 @@
           return;
         }
 
+        // Prix inconnu : chargé seulement sur un clic, comme dans la collection.
+        if (!cacheEntry) {
+          const blocked = runtime.priceLoader.isBlocked();
+          valueEl.className = 'wm-marketplace-average-value wm-marketplace-average-ask';
+          valueEl.textContent = blocked ? 'Prix en pause' : 'Voir le prix';
+          valueEl.title = blocked
+            ? `Le site a limité les requêtes : réessaie après ${timeFormat.format(runtime.priceLoader.blockedUntil())}`
+            : 'Charger le prix moyen de la semaine pour cette carte';
+          if (!blocked) valueEl.dataset.wmAskId = id;
+          return;
+        }
+
         const average = chooseAverage(cacheEntry, null, meta.rarity || null);
         valueEl.className = 'wm-marketplace-average-value';
         valueEl.textContent = average == null ? '—' : `${formatAverage(average)} W`;
+        if (!runtime.priceLoader.isFresh(cacheEntry)) {
+          valueEl.dataset.wmAskId = id;
+          valueEl.title = `Prix moyen de la semaine au ${dateFormat.format(cacheEntry.fetchedAt)} : clic pour l'actualiser`;
+        }
       }
 
       // Annonces vues dans la liste du Marketplace, par id d'enchère.
@@ -588,7 +641,6 @@
         if (!isMarketplaceDetailPage() || event.detail?.auctionId !== location.pathname.split('/')[2]) return;
         marketplaceCardId = card.id;
         marketplaceRequestedPath = location.pathname;
-        marketplaceRequestedAt = Date.now();
         registerCards([card]);
         renderMarketplaceAverage(card.id);
 
@@ -622,34 +674,12 @@
         if (!isMarketplaceDetailPage()) return;
 
         if (marketplaceRequestedPath !== location.pathname) {
+          marketplaceRequestedPath = location.pathname;
           marketplaceCardId = null;
           document.getElementById('wm-marketplace-average')?.remove();
         }
-        if (marketplaceCardId) {
-          renderMarketplaceAverage(marketplaceCardId);
-          return;
-        }
-
-        const match = location.pathname.match(
-          /^\/marketplace\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i
-        );
-        const auctionId = match?.[1];
-        if (!auctionId) return;
-
-        const now = Date.now();
-        if (
-          marketplaceRequestedPath === location.pathname &&
-          now - marketplaceRequestedAt < 2500
-        ) {
-          return;
-        }
-
-        marketplaceRequestedPath = location.pathname;
-        marketplaceRequestedAt = now;
-
-        window.dispatchEvent(new CustomEvent('wm-average-load-marketplace-detail', {
-          detail: { auctionId }
-        }));
+        // L'annonce arrive par la requête du site, lue au passage : l'extension n'en envoie pas.
+        if (marketplaceCardId) renderMarketplaceAverage(marketplaceCardId);
       }
 
       return {

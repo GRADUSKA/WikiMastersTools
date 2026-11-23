@@ -352,10 +352,8 @@
 
       const { sleep } = registry.timer;
 
-      // 403 et 429 : le site (ou son pare-feu) limite le débit, une pause suffit souvent.
-      const isThrottleStatus = (status) => status === 403 || status === 429;
-      const isRetryableStatus = (status) =>
-        isThrottleStatus(status) || status === 408 || (status >= 500 && status <= 599);
+      // 403 et 429 : le site limite les requêtes automatisées. On s'arrête au lieu d'insister.
+      const isRetryableStatus = (status) => status === 408 || (status >= 500 && status <= 599);
 
       async function fetchJsonRetry(url, options = {}, {
         label = 'Requête',
@@ -380,11 +378,6 @@
 
             if (!isRetryableStatus(response.status) || attempt >= maxAttempts) {
               throw lastError;
-            }
-
-            if (isThrottleStatus(response.status)) {
-              const retryAfterMs = Number(response.headers.get('Retry-After')) * 1000 || 0;
-              delayMs = Math.min(30000, Math.max(retryAfterMs, 3000 * attempt));
             }
           } catch (rawError) {
             // Sans réponse dans le délai, le site traîne, souvent parce qu'il nous freine.

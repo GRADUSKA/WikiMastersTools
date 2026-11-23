@@ -6,13 +6,6 @@
       const { isTradesPage, normalizeTitle, cardMetaById, idByTitle, cacheMemory, renderCollectionCard, reportError, loadCacheForCards, formatAverage, chooseAverage, registerCards, isFeatureEnabled, currentUserId } = deps;
       const tradesById = new Map();
       const activeTradeValueIds = new Set();
-      let tradesRequested = false;
-      function ensureTradesLoaded() {
-        if (!isFeatureEnabled('tradeValues') && !isFeatureEnabled('tradePreviews')) return;
-        if (!isTradesPage() || tradesRequested) return;
-        tradesRequested = true;
-        window.dispatchEvent(new CustomEvent('wm-average-load-trades'));
-      }
     
       function getTradeDetailModal() {
         if (!isTradesPage()) return null;
@@ -177,7 +170,8 @@
             ).values()];
     
             try {
-              loadCacheForCards(cards, { priority: true });
+              // Clic sur « Valeurs » : les prix manquants partent un par un, au rythme du chargeur.
+              loadCacheForCards(cards, { manual: true });
             } catch (error) {
               reportError('prix échange', error);
             }
@@ -494,10 +488,6 @@
         }
       }
       
-      function resetTradesRequest() {
-        tradesRequested = false;
-      }
-      
       window.addEventListener('wm-average-trades', (event) => {
           if (!isFeatureEnabled('tradeValues') && !isFeatureEnabled('tradePreviews')) return;
           const detail = event.detail || {};
@@ -516,13 +506,11 @@
           renderTradeDetailCards();
         });
       return {
-        ensureTradesLoaded,
         renderTradeDetailCard,
         renderTradeDetailCards,
         renderTradeButtons,
         renderTradePreviews,
-        renderTradeValuesForCard,
-        resetTradesRequest
+        renderTradeValuesForCard
       };
     }
   };

@@ -807,11 +807,16 @@
           value.className = 'wm-pack-recap-price';
 
           const cacheEntry = cacheMemory.get(card.id);
-          if (!cacheEntry) {
+          if (runtime.priceLoader.isPending(card.id)) {
             value.classList.add('is-loading');
             const spinner = document.createElement('span');
             spinner.className = 'wm-average-spinner';
             value.append(spinner, document.createTextNode('…'));
+          } else if (!cacheEntry) {
+            value.classList.add('is-ask');
+            value.dataset.wmAskId = card.id;
+            value.title = 'Charger le prix moyen de cette carte';
+            value.textContent = 'Voir le prix';
           } else {
             const average = chooseAverage(cacheEntry, null, card.rarity || null);
             if (Number.isFinite(average)) {
@@ -832,7 +837,7 @@
         footer.className = 'wm-pack-recap-footer';
 
         if (loaded < activePackRecap.cards.length) {
-          footer.textContent = 'Chargement des prix moyens…';
+          footer.textContent = `Total connu : ${formatAverage(total)} W • clique sur « Voir le prix » pour une carte`;
         } else if (priced === 0) {
           footer.textContent = 'Aucune carte n’a de prix moyen';
         } else {
