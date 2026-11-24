@@ -148,6 +148,29 @@
         }
       }
 
+      // Toutes les listes du Marché, y compris « mine=1 » (tes ventes, enchères et achats).
+      function isMarketplaceFeedApi(url) {
+        try {
+          return new URL(url, location.origin).pathname === '/api/marketplace';
+        } catch (_) {
+          return false;
+        }
+      }
+
+      // Chaque annonce porte « owned » : possèdes-tu encore cette carte ? C'est ce qu'affiche
+      // le badge « Possédée » du site, notamment sur l'historique de tes ventes.
+      function emitOwnership(json) {
+        const lists = Array.isArray(json) ? [json] : Object.values(json || {}).filter(Array.isArray);
+        const owned = {};
+        for (const auction of lists.flat()) {
+          const id = auction?.card_id || auction?.card?.id;
+          if (id && typeof auction.owned === 'boolean') owned[id] = auction.owned;
+        }
+        if (Object.keys(owned).length) {
+          window.dispatchEvent(new CustomEvent('wm-average-ownership', { detail: { owned } }));
+        }
+      }
+
       function isTradesApi(url) {
         try {
           const parsed = new URL(url, location.origin);
@@ -408,7 +431,7 @@
       return {
         originalFetch, MAX_COLLECTION_PAGES, MAX_BULK_PACKS, RARITY_ORDER,
         MARKETPLACE_MINE_CACHE_TTL, mapTags, mapEntry, extractCards, emitCollection,
-        isMarketplaceDetailApi, isMarketplaceListApi, isPacksOpenApi, isTradesApi,
+        isMarketplaceDetailApi, isMarketplaceListApi, isMarketplaceFeedApi, emitOwnership, isPacksOpenApi, isTradesApi,
         isGlobalCardsApi, getGlobalCollectionSummaryCardId, emitGlobalCollectionInspectedCard,
         mapPackCards, emitPackOpened, mapTrade, emitTrades, fetchTrades,
         emitMarketplaceDetail, emitMarketplaceList, fetchJsonRetry, sleep

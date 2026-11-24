@@ -427,6 +427,28 @@
         }
       }
 
+      // Le Marché dit pour chaque carte si elle est encore possédée : une carte vendue ou échangée
+      // sort de la collection mémorisée, donc de « Plus chères ».
+      async function forgetUnownedCards(ids) {
+        if (!ids.length) return;
+        for (const id of ids) {
+          const meta = cardMetaById.get(id);
+          if (meta) cardMetaById.set(id, { ...meta, ownedCardId: null, ownedCardIds: [] });
+        }
+
+        await collectionReady;
+        const gone = new Set(ids);
+        const entry = readCollection();
+        if (!Array.isArray(entry?.cards) || !entry.cards.some((card) => gone.has(card?.id))) return;
+        storageSet({ [ALL_COLLECTION_KEY]: { ...entry, cards: entry.cards.filter((card) => !gone.has(card?.id)) } });
+      }
+
+      window.addEventListener('wm-average-ownership', (event) => {
+        const owned = event.detail?.owned || {};
+        forgetUnownedCards(Object.keys(owned).filter((id) => owned[id] === false))
+          .catch((error) => reportError('collection', error));
+      });
+
       // Fin du chemin seulement : la vignette PNG d'un fichier « x.gif » n'est pas animée,
       // et une image en data: (pixel transparent de l'extension) n'est pas une illustration.
       function isGifImage(url) {

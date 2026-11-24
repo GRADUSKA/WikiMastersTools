@@ -5,6 +5,7 @@
     create(runtime) {
       const {
         originalFetch, emitCollection, isMarketplaceDetailApi, isMarketplaceListApi, isPacksOpenApi,
+        isMarketplaceFeedApi, emitOwnership,
         isTradesApi, isGlobalCardsApi,
         getGlobalCollectionSummaryCardId, emitGlobalCollectionInspectedCard,
         emitTrades, fetchTrades,
@@ -31,8 +32,11 @@
               response.clone().json().then(emitTrades).catch(() => {});
             } else if (url && isMarketplaceDetailApi(url)) {
               response.clone().json().then(emitMarketplaceDetail).catch(() => {});
-            } else if (url && isMarketplaceListApi(url) && method.toUpperCase() === 'GET') {
-              response.clone().json().then(emitMarketplaceList).catch(() => {});
+            } else if (url && isMarketplaceFeedApi(url) && method.toUpperCase() === 'GET') {
+              response.clone().json().then((json) => {
+                emitOwnership(json);
+                if (isMarketplaceListApi(url)) emitMarketplaceList(json);
+              }).catch(() => {});
             } else if (url && isPacksOpenApi(url)) {
               response.clone().json().then(emitPackOpened).catch(() => {});
             }
@@ -62,7 +66,7 @@
               isGlobalCardsApi(this.__wmUrl) ||
               isTradesApi(this.__wmUrl) ||
               isMarketplaceDetailApi(this.__wmUrl) ||
-              isMarketplaceListApi(this.__wmUrl) ||
+              isMarketplaceFeedApi(this.__wmUrl) ||
               isPacksOpenApi(this.__wmUrl)
             )
           ) {
@@ -84,8 +88,9 @@
                   emitTrades(json);
                 } else if (isMarketplaceDetailApi(this.__wmUrl)) {
                   emitMarketplaceDetail(json);
-                } else if (isMarketplaceListApi(this.__wmUrl)) {
-                  emitMarketplaceList(json);
+                } else if (isMarketplaceFeedApi(this.__wmUrl)) {
+                  emitOwnership(json);
+                  if (isMarketplaceListApi(this.__wmUrl)) emitMarketplaceList(json);
                 } else if (isPacksOpenApi(this.__wmUrl)) {
                   emitPackOpened(json);
                 }

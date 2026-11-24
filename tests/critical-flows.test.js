@@ -836,6 +836,45 @@ test('la liste du Marketplace est lue, mais pas la requête « mine=1 » de Mes 
   ]]));
 });
 
+test('les listes du Marché, « mine=1 » comprise, disent quelles cartes sont encore possédées', () => {
+  const h = harness(['bridge/core.js']);
+  h.window.fetch = async () => response({});
+  const core = h.window.__wmBridgeFeatures.bridgeCore.create();
+  const events = [];
+  h.window.addEventListener('wm-average-ownership', e => events.push(e.detail.owned));
+
+  assert.equal(core.isMarketplaceFeedApi('/api/marketplace?page=1&limit=50&sort=recent&mine=1'),true);
+  assert.equal(core.isMarketplaceFeedApi('/api/marketplace/00000000-0000-4000-8000-000000000000'),false);
+
+  core.emitOwnership({page:1, history:[
+    {id:'v1', card_id:'sold', owned:false, status:'settled_sold'},
+    {id:'v2', card:{id:'kept'}, owned:true, status:'cancelled'},
+    {id:'v3', card_id:'unknown'}
+  ], selling:[]});
+  core.emitOwnership({history:[]});
+  assert.equal(JSON.stringify(events), JSON.stringify([{sold:false, kept:true}]));
+});
+
+test('une carte que le Marché dit non possédée sort de la collection mémorisée', async () => {
+  const h = priceHarness();
+  const {core} = h;
+  await core.collectionReady;
+  core.storageSet({[core.ALL_COLLECTION_KEY]:{fetchedAt:123, complete:true, cards:[
+    {...card, id:'sold'}, {...card, id:'kept'}
+  ]}});
+  core.registerCards([{...card, id:'sold', ownedCardId:'o1', ownedCardIds:['o1']}]);
+
+  h.send('wm-average-ownership', {owned:{sold:false, kept:true}});
+  await flush();
+
+  const stored = core.readCollection();
+  assert.deepEqual(stored.cards.map(c => c.id), ['kept']);
+  assert.equal(stored.complete, true);
+  assert.equal(stored.fetchedAt, 123);
+  assert.equal(core.cardMetaById.get('sold').ownedCardIds.length, 0);
+  assert.equal(core.cardMetaById.get('sold').ownedCardId, null);
+});
+
 test('une moyenne de 0 n’est pas traitée comme une carte bon marché', () => {
   const h = loaderHarness();
   h.loader.loadCacheForCards([{...card,id:'r0',rarity:'R'}], {manual:true});
