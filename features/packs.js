@@ -735,6 +735,18 @@
         });
       }
 
+      // Pendant la révélation, seules les cartes déjà retournées sont listées, pour ne rien dévoiler.
+      function revealedPackCards() {
+        const { cards, revealed } = activePackRecap;
+        if (isLastPullCardVisible()) return cards;
+
+        const shown = new Set([...document.querySelectorAll('main *')].map((el) => normalizeTitle(el.textContent)));
+        for (const card of cards) {
+          if (shown.has(normalizeTitle(card.title))) revealed.add(card.id);
+        }
+        return cards.filter((card) => revealed.has(card.id));
+      }
+
       function renderPackRecap() {
         const existing = document.getElementById('wm-pack-recap');
 
@@ -743,14 +755,19 @@
           !isPullsPage() ||
           !pullRecapEnabled ||
           packRecapDismissed ||
-          !activePackRecap?.cards?.length ||
-          !isLastPullCardVisible()
+          !activePackRecap?.cards?.length
         ) {
           existing?.remove();
           return;
         }
 
-        const signature = JSON.stringify(activePackRecap.cards.map((card) => [
+        const cards = revealedPackCards();
+        if (!cards.length) {
+          existing?.remove();
+          return;
+        }
+
+        const signature = JSON.stringify(cards.map((card) => [
           card.id, card.rarity, cacheMemory.get(card.id)
         ]));
         if (existing?.dataset.signature === signature) return;
@@ -768,8 +785,8 @@
         title.textContent = 'Prix moyens du paquet';
 
         const subtitle = document.createElement('span');
-        const loaded = activePackRecap.cards.filter((card) => cacheMemory.has(card.id)).length;
-        subtitle.textContent = `${loaded}/${activePackRecap.cards.length} chargées`;
+        const loaded = cards.filter((card) => cacheMemory.has(card.id)).length;
+        subtitle.textContent = `${loaded}/${cards.length} chargées`;
 
         headingWrap.append(title, subtitle);
 
@@ -791,7 +808,7 @@
         let total = 0;
         let priced = 0;
 
-        for (const card of activePackRecap.cards) {
+        for (const card of cards) {
           const row = document.createElement('div');
           row.className = 'wm-pack-recap-row';
 
@@ -836,7 +853,7 @@
         const footer = document.createElement('div');
         footer.className = 'wm-pack-recap-footer';
 
-        if (loaded < activePackRecap.cards.length) {
+        if (loaded < cards.length) {
           footer.textContent = `Total connu : ${formatAverage(total)} W • clique sur « Voir le prix » pour une carte`;
         } else if (priced === 0) {
           footer.textContent = 'Aucune carte n’a de prix moyen';
@@ -869,7 +886,8 @@
 
         activePackRecap = {
           openedAt: Date.now(),
-          cards
+          cards,
+          revealed: new Set()
         };
         packRecapDismissed = false;
         renderPackRecap();

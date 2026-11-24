@@ -703,6 +703,28 @@ test('le récap natif évite de recréer le DOM quand les prix n’ont pas chang
   assert.equal(panel.children,children);
 });
 
+test('pendant la révélation, le récap ne liste que les cartes déjà retournées', () => {
+  const document=documentFixture();
+  const fresh=harness(['features/core.js','features/price-ui.js','features/packs.js'], {document,localStorage:storageFixture(),sessionStorage:storageFixture(),location:{pathname:'/pulls'}});
+  const registry=fresh.window.__wmAverageFeatures, core=registry.core.create();
+  let last=false, shown=[];
+  core.isLastPullCardVisible=() => last;
+  const bodyQuery=document.querySelectorAll;
+  document.querySelectorAll=selector => selector==='main *' ? shown.map(textContent => ({textContent})) : bodyQuery(selector);
+  const runtime={core,settings:{isEnabled:() => true},pullStats:{recordPullStats() {}},priceLoader:{loadCacheForCards() {},isPending:() => false}};
+  runtime.priceUi=registry.priceUi.create(runtime); runtime.packs=registry.packs.create(runtime);
+  const other={id:'b', title:'Carte B', rarity:'R'};
+  const names=() => document.querySelectorAll('.wm-pack-recap-name').map(el => el.textContent).join(',');
+  fresh.send('wm-average-pack-opened',{cards:[card,other]});
+  assert.equal(document.getElementById('wm-pack-recap'),null);
+  shown=['Carte A']; runtime.packs.renderPackRecap();
+  assert.equal(names(),'Carte A');
+  shown=['Carte B']; runtime.packs.renderPackRecap();
+  assert.equal(names(),'Carte A,Carte B');
+  shown=[]; last=true; runtime.packs.renderPackRecap();
+  assert.equal(names(),'Carte A,Carte B');
+});
+
 test('la navigation entre annonces n’envoie aucune requête et ignore une ancienne réponse', () => {
   const a='00000000-0000-0000-0000-000000000001', b='00000000-0000-0000-0000-000000000002';
   const h=priceHarness({document:{querySelectorAll:() => [],getElementById:() => null},location:{pathname:'/marketplace/'+a}});

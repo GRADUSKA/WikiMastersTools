@@ -70,6 +70,7 @@ paquet réel n'est consommé par ces tests.
 
 *Heure de Paris*
 
+- **24/11/2026 — v4.43.0** — Ouverture d'un paquet : le récap « Prix moyens du paquet » apparaît dès la première carte retournée, et non plus seulement à la dernière. Il ne liste que les cartes déjà dévoilées, pour ne rien gâcher : un clic sur « Voir le prix » charge le prix de la carte que tu regardes.
 - **24/11/2026 — v4.42.0** — « Plus chères » retire les cartes que tu ne possèdes plus. Quand tu ouvres le Marché, le site indique pour chaque annonce (dont tes 50 dernières ventes) si tu as encore la carte : l'extension lit cette réponse, sans requête de plus, et sort les cartes vendues de la collection mémorisée.
 - **23/11/2026 — v4.41.0** — Vue « GIFs » : un clic sur une carte ouvre sa fiche du site (étiquettes, favori, enchères). L'extension cherche son titre dans la collection comme si tu le tapais, ouvre la fiche, puis la liste des GIF revient quand tu la fermes. La recherche du site est remise comme avant à la fermeture de la vue.
 - **23/11/2026 — v4.40.0** — « Plus chères » : sous chaque prix, le nombre de ventes sur 30 jours (en orange sous 2 ventes), pour repérer un prix qui repose sur une vente isolée. Nouvelle case « ≥ 2 ventes / 30 j » pour masquer ces cartes. Un prix chargé avant cette version affiche « ventes ? (clic) » : un clic l'actualise avec son nombre de ventes.
