@@ -355,6 +355,27 @@
         console.error(`[WM Average] ${scope}`, error);
       }
 
+      const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+      async function waitFor(find, timeoutMs) {
+        const end = Date.now() + timeoutMs;
+        while (Date.now() < end) {
+          const found = find();
+          if (found) return found;
+          await wait(200);
+        }
+        return null;
+      }
+
+      const siteSearchInput = () => [...document.querySelectorAll('input')]
+        .find((input) => /Rechercher/.test(input.placeholder || '') && !input.closest('.wm-modal-overlay'));
+
+      // Le champ est contrôlé par React : il faut passer par le setter natif pour qu'il voie la saisie.
+      function setSiteSearch(input, value) {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, value);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+
       // Étiquettes { id, name, color } fusionnées sans doublon (par id, ou par nom à défaut).
       function mergeTags(...lists) {
         const byKey = new Map();
@@ -449,6 +470,48 @@
           .catch((error) => reportError('collection', error));
       });
 
+      // Le site enregistre étiquettes et favori sans réponse lisible : chaque page de collection
+      // qu'il affiche donne leur état actuel, qui remplace celui du dernier chargement complet.
+      // Seulement si la page montre tous les exemplaires connus : sinon on ajoute sans rien retirer.
+      async function refreshStoredMarks(cards) {
+        const seen = new Map();
+        for (const card of cards) {
+          const previous = seen.get(card.id);
+          const copies = Array.isArray(card.ownedCardIds) ? card.ownedCardIds : [];
+          seen.set(card.id, previous
+            ? {
+                copies: [...previous.copies, ...copies],
+                starred: previous.starred || card.starred === true,
+                tags: mergeTags(previous.tags, card.tags)
+              }
+            : { copies, starred: card.starred === true, tags: mergeTags(card.tags) });
+        }
+
+        await collectionReady;
+        const entry = readCollection();
+        if (!Array.isArray(entry?.cards) || !entry.cards.some((card) => seen.has(card?.id))) return;
+
+        let changed = false;
+        const next = entry.cards.map((card) => {
+          const fresh = seen.get(card?.id);
+          if (!fresh) return card;
+          const known = Array.isArray(card.ownedCardIds) ? card.ownedCardIds : [];
+          const whole = known.every((id) => fresh.copies.includes(id));
+          const tags = whole ? fresh.tags : mergeTags(card.tags, fresh.tags);
+          const starred = whole ? fresh.starred : Boolean(card.starred || fresh.starred);
+          if (starred === Boolean(card.starred) && JSON.stringify(tags) === JSON.stringify(mergeTags(card.tags))) return card;
+          changed = true;
+          return { ...card, tags, starred };
+        });
+        if (changed) storageSet({ [ALL_COLLECTION_KEY]: { ...entry, cards: next } });
+      }
+
+      window.addEventListener('wm-average-collection', (event) => {
+        const cards = event.detail?.cards;
+        if (!Array.isArray(cards) || !cards.length) return;
+        refreshStoredMarks(cards).catch((error) => reportError('étiquettes', error));
+      });
+
       // Fin du chemin seulement : la vignette PNG d'un fichier « x.gif » n'est pas animée,
       // et une image en data: (pixel transparent de l'extension) n'est pas une illustration.
       function isGifImage(url) {
@@ -485,7 +548,8 @@
         cacheKey, readLocalValue, writeLocalValue, toStoredCard, storageGet, storageSet, collectionReady, readCollection,
         isCacheEntryValid, cleanupPriceCacheOnceDaily, clearCaches, PRICE_PACE_KEY, PRICE_BLOCK_KEY,
         isContextInvalidatedError,
-        reportError, mergeTags, registerCards, preserveOwnedMeta, isGifImage
+        reportError, mergeTags, registerCards, preserveOwnedMeta, isGifImage,
+        wait, waitFor, siteSearchInput, setSiteSearch
       };
     }
   };

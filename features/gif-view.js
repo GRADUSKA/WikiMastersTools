@@ -4,7 +4,8 @@
   registry.gifView = {
     create(runtime) {
       const {
-        collectionReady, readCollection, isGifImage, isCollectionPage, RARITIES, cacheMemory, reportError
+        collectionReady, readCollection, isGifImage, isCollectionPage, RARITIES, cacheMemory, reportError,
+        waitFor, siteSearchInput, setSiteSearch
       } = runtime.core;
       const SETTING_KEY = 'gifView';
       let toolbarButton = null;
@@ -28,29 +29,8 @@
           ));
       }
 
-      const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-      async function waitFor(find, timeoutMs) {
-        const end = Date.now() + timeoutMs;
-        while (Date.now() < end) {
-          const found = find();
-          if (found) return found;
-          await wait(200);
-        }
-        return null;
-      }
-
-      const siteSearchInput = () => [...document.querySelectorAll('input')]
-        .find((input) => /Rechercher/.test(input.placeholder || '') && !input.closest('.wm-modal-overlay'));
-
       const siteCard = (id) => [...document.querySelectorAll(`[data-wm-card-id="${CSS.escape(id)}"]`)]
         .find((node) => !node.closest('.wm-modal-overlay'));
-
-      // Le champ est contrôlé par React : il faut passer par le setter natif pour qu'il voie la saisie.
-      function setSiteSearch(input, value) {
-        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, value);
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-      }
 
       // Étiquettes, favori, enchères : tout passe par la fiche du site. On cherche la carte
       // comme si on tapait son titre, on ouvre sa fiche, puis on revient à la liste des GIF.

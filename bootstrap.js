@@ -101,6 +101,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       'features/ranking.js',
       'features/collection-bulk.js',
       'features/gif-view.js',
+      'features/wishlist-link.js',
       'features/extra-tools.js',
       'features/theme-tracker.js',
       'features/my-bids-logic.js',

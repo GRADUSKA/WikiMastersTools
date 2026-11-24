@@ -725,6 +725,40 @@ test('pendant la révélation, le récap ne liste que les cartes déjà retourn�
   assert.equal(names(),'Carte A,Carte B');
 });
 
+test('souhait depuis un profil : nouvel onglet, puis recherche et fiche de la carte dans Toutes les cartes', async () => {
+  const opened=[], replaced=[], searched=[], clicked=[];
+  const node=(name, extra={}) => ({...extra, click() { clicked.push(name); }});
+  const h3=title => ({textContent:title, closest:() => node(title)});
+  const profileCard={children:[], querySelector(selector) { return selector==='h3' ? h3('Pangolin à petites écailles') : this.children[0] || null; }, append(child) { this.children.push(child); }};
+  const pages={
+    '/profile/greendesk':{'main div[class*="glow-"][class*="cursor-pointer"]':[profileCard]},
+    // La racine de la page porte des classes wm-… de l'extension : seule une fenêtre de l'extension doit écarter un bouton.
+    '/global-collection':{'main button':[node('Rechercher',{textContent:'Rechercher',closest:selector => selector==='.wm-modal-overlay' ? null : {}})],'main h3':[h3('Autre carte'),h3('Pangolin à petites écailles')]}
+  };
+  const location={pathname:'/profile/greendesk', search:'', hash:''};
+  const document={querySelectorAll:selector => pages[location.pathname][selector] || [], querySelector:selector => (pages[location.pathname][selector] || [])[0] || null, createElement:() => {
+    const button=new EventTarget(); button.textContent=''; return button;
+  }};
+  const h=harness(['features/wishlist-link.js'], {document, location, history:{state:null, replaceState:(state,title,url) => replaced.push(url)}});
+  h.window.open=(url) => opened.push(url);
+  const input={};
+  const core={
+    isGlobalCollectionPage:() => location.pathname==='/global-collection', normalizeTitle:v => String(v||'').trim(), reportError(scope,error) { throw error; },
+    wait:async () => {}, waitFor:async find => find(), siteSearchInput:() => input, setSiteSearch:(target,value) => searched.push(value)
+  };
+  const feature=h.window.__wmAverageFeatures.wishlistLink.create({core,settings:{isEnabled:() => true},modalUi:{showInfoModal() { throw new Error('introuvable'); }}});
+  feature.render(); feature.render();
+  assert.equal(profileCard.children.length,1);
+  profileCard.children[0].dispatchEvent(new Event('click'));
+  assert.equal(opened.length,1);
+  assert.equal(opened[0],'/global-collection#wm-wish=Pangolin%20%C3%A0%20petites%20%C3%A9cailles');
+  Object.assign(location,{pathname:'/global-collection', hash:opened[0].slice(opened[0].indexOf('#'))});
+  feature.render(); await flush();
+  assert.equal(replaced.join(),'/global-collection');
+  assert.equal(searched.join(),'Pangolin à petites écailles');
+  assert.equal(clicked.join(),'Rechercher,Pangolin à petites écailles');
+});
+
 test('la navigation entre annonces n’envoie aucune requête et ignore une ancienne réponse', () => {
   const a='00000000-0000-0000-0000-000000000001', b='00000000-0000-0000-0000-000000000002';
   const h=priceHarness({document:{querySelectorAll:() => [],getElementById:() => null},location:{pathname:'/marketplace/'+a}});
@@ -895,6 +929,32 @@ test('une carte que le Marché dit non possédée sort de la collection mémoris
   assert.equal(stored.fetchedAt, 123);
   assert.equal(core.cardMetaById.get('sold').ownedCardIds.length, 0);
   assert.equal(core.cardMetaById.get('sold').ownedCardId, null);
+});
+
+test('une page de collection du site met à jour les étiquettes et le favori mémorisés', async () => {
+  const h = priceHarness();
+  const {core} = h;
+  await core.collectionReady;
+  const info = {id:'t1', name:'Info', color:'#eb8837'}, old = {id:'t0', name:'Ancienne', color:null};
+  core.storageSet({[core.ALL_COLLECTION_KEY]:{fetchedAt:123, complete:true, cards:[
+    {...card, id:'vie', ownedCardIds:['o1'], tags:[old], starred:false},
+    {...card, id:'double', ownedCardIds:['o2','o3'], tags:[old], starred:true},
+    {...card, id:'autre', ownedCardIds:['o4'], tags:[old]}
+  ]}});
+
+  h.send('wm-average-collection', {cards:[
+    {...card, id:'vie', ownedCardIds:['o1'], tags:[info], starred:true},
+    {...card, id:'double', ownedCardIds:['o2'], tags:[info], starred:false}
+  ]});
+  await flush();
+
+  const byId = new Map(core.readCollection().cards.map(c => [c.id, c]));
+  assert.equal(byId.get('vie').tags.map(t => t.name).join(), 'Info');
+  assert.equal(byId.get('vie').starred, true);
+  assert.equal(byId.get('double').tags.map(t => t.name).join(), 'Ancienne,Info');
+  assert.equal(byId.get('double').starred, true);
+  assert.equal(byId.get('autre').tags.map(t => t.name).join(), 'Ancienne');
+  assert.equal(core.readCollection().fetchedAt, 123);
 });
 
 test('une moyenne de 0 n’est pas traitée comme une carte bon marché', () => {

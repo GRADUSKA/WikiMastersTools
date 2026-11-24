@@ -19,6 +19,7 @@
     'ranking',
     'collectionBulk',
     'gifView',
+    'wishlistLink',
     'extraTools',
     'themeTracker',
     'myBidsLogic',
@@ -110,6 +111,7 @@
   runtime.ranking = featureRegistry.ranking.create(runtime);
   runtime.collectionBulk = featureRegistry.collectionBulk.create(runtime);
   runtime.gifView = featureRegistry.gifView.create(runtime);
+  runtime.wishlistLink = featureRegistry.wishlistLink.create(runtime);
   runtime.extraTools = featureRegistry.extraTools.create(runtime);
   runtime.themeTracker = featureRegistry.themeTracker.create(runtime);
   runtime.myBidsLogic = featureRegistry.myBidsLogic.create();

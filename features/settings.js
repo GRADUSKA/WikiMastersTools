@@ -17,6 +17,7 @@
         marketplacePrice: true,
         marketplaceDeals: true,
         gifView: true,
+        wishlistLink: true,
         globalCollectionPrice: true,
         ranking: true,
         rankingSales: true,
@@ -53,7 +54,8 @@
             ['ranking', 'Classement « Plus chères »', 'Ajoute le classement des cartes connues par prix moyen.'],
             ['rankingSales', 'Mise en vente depuis le classement', 'Affiche les contrôles pour mettre directement une carte en vente depuis le classement.'],
             ['compactMode', 'Mode compact', 'Ajoute le bouton Compact dans les vues collection.'],
-            ['gifView', 'Cartes GIF', 'Ajoute le bouton « GIFs » à la collection : affiche les cartes dont l’illustration du site est un GIF.']
+            ['gifView', 'Cartes GIF', 'Ajoute le bouton « GIFs » à la collection : affiche les cartes dont l’illustration du site est un GIF.'],
+            ['wishlistLink', 'Souhait depuis un profil', 'Ajoute « ♡ Souhait » sur les cartes du profil d’un joueur : ouvre la carte dans « Toutes les cartes », dans un nouvel onglet, pour l’ajouter à ta liste de souhaits.']
           ]
         },
         {

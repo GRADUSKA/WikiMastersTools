@@ -47,6 +47,7 @@
 
         runtime.compactMode.ensureCompactControl();
         runtime.cardExtras.renderCardExtras();
+        runtime.wishlistLink.render();
         runtime.extraTools.render();
       }
 
@@ -108,7 +109,7 @@
             '.wm-wikipedia-card-button, .wm-missing-image-credit, .wm-missing-title-art, .wm-compact-tools, .wm-price-legend, ' +
             '.wm-auto-open-control, .wm-auto-open-help, .wm-settings-launch, .wm-settings-modal, ' +
             '.wm-copy-card-button, .wm-trade-preview-card, #wm-theme-tracker-page, #wm-theme-tracker-nav, ' +
-            '#wm-my-bids-page, #wm-my-bids-nav, .wm-market-deal'
+            '#wm-my-bids-page, #wm-my-bids-nav, .wm-market-deal, .wm-wish-button'
           )
         );
       }
