@@ -31,8 +31,9 @@
           runtime.packs.ensurePullsToolbar();
           runtime.packs.updateAutoOpenToggleUi();
           runtime.pullStats.renderPullStats();
-          runtime.packs.renderPackRecap();
         }
+        // Hors de /pulls aussi : c'est là qu'il retire le récap resté affiché.
+        runtime.packs.renderPackRecap();
 
         if (isTradesPage()) {
           runtime.trades.renderTradeButtons();

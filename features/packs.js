@@ -738,7 +738,12 @@
       // Pendant la révélation, seules les cartes déjà retournées sont listées, pour ne rien dévoiler.
       function revealedPackCards() {
         const { cards, revealed } = activePackRecap;
-        if (isLastPullCardVisible()) return cards;
+        if (isLastPullCardVisible()) {
+          activePackRecap.lastSeen = true;
+          return cards;
+        }
+        // « Continuer » après la dernière carte retire le compteur « Carte 5 / 5 » : le paquet est terminé.
+        if (activePackRecap.lastSeen) return [];
 
         const shown = new Set([...document.querySelectorAll('main *')].map((el) => normalizeTitle(el.textContent)));
         for (const card of cards) {
@@ -749,10 +754,11 @@
 
       function renderPackRecap() {
         const existing = document.getElementById('wm-pack-recap');
+        // Quitter les paquets referme le récap : il ne doit pas revenir au retour sur la page.
+        if (!isPullsPage()) activePackRecap = null;
 
         if (
           !runtime.settings.isEnabled('packRecap') ||
-          !isPullsPage() ||
           !pullRecapEnabled ||
           packRecapDismissed ||
           !activePackRecap?.cards?.length

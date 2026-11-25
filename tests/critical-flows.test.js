@@ -703,6 +703,21 @@ test('le récap natif évite de recréer le DOM quand les prix n’ont pas chang
   assert.equal(panel.children,children);
 });
 
+test('quitter les paquets ferme le récap, sans qu’il revienne au retour', () => {
+  const document=documentFixture(), location={pathname:'/pulls'};
+  const fresh=harness(['features/core.js','features/price-ui.js','features/packs.js'], {document,localStorage:storageFixture(),sessionStorage:storageFixture(),location});
+  const registry=fresh.window.__wmAverageFeatures, core=registry.core.create();
+  core.isLastPullCardVisible=() => true;
+  const runtime={core,settings:{isEnabled:() => true},pullStats:{recordPullStats() {}},priceLoader:{loadCacheForCards() {},isPending:() => false}};
+  runtime.priceUi=registry.priceUi.create(runtime); runtime.packs=registry.packs.create(runtime);
+  fresh.send('wm-average-pack-opened',{cards:[card]});
+  assert.ok(document.getElementById('wm-pack-recap'));
+  location.pathname='/collection'; runtime.packs.renderPackRecap();
+  assert.equal(document.getElementById('wm-pack-recap'),null);
+  location.pathname='/pulls'; runtime.packs.renderPackRecap();
+  assert.equal(document.getElementById('wm-pack-recap'),null);
+});
+
 test('pendant la révélation, le récap ne liste que les cartes déjà retournées', () => {
   const document=documentFixture();
   const fresh=harness(['features/core.js','features/price-ui.js','features/packs.js'], {document,localStorage:storageFixture(),sessionStorage:storageFixture(),location:{pathname:'/pulls'}});
@@ -723,6 +738,8 @@ test('pendant la révélation, le récap ne liste que les cartes déjà retourn�
   assert.equal(names(),'Carte A,Carte B');
   shown=[]; last=true; runtime.packs.renderPackRecap();
   assert.equal(names(),'Carte A,Carte B');
+  last=false; shown=['Carte A']; runtime.packs.renderPackRecap();
+  assert.equal(document.getElementById('wm-pack-recap'),null);
 });
 
 test('souhait depuis un profil : nouvel onglet, puis recherche et fiche de la carte dans Toutes les cartes', async () => {
